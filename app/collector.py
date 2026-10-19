@@ -28,8 +28,16 @@ SUB_INIT = 32 << 20
 HUMAN = b'"origin":{"kind":"human"}'
 ASK_TOOLS = {"AskUserQuestion": "在问你问题，等你回答", "ExitPlanMode": "计划写好了，等你批准"}
 INSTANT_TOOLS = {"Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit"}
-LIVE = ("run", "ask", "confirm", "subs")
+LIVE = ("run", "ask", "confirm", "bg")
 NOTE_KIND = {"completed": "done", "failed": "error"}
+BG_TOOLS = ("Bash", "PowerShell")
+OUT_TAIL = 4096          # 后台命令的输出只读最后这么多字节，取最后一行当进度
+
+# 常驻的后台命令（开着的服务器、盯着文件变的）：起了就不会自己结束，不等它，对话照常算完成
+RE_RESIDENT = re.compile(r"\b(?:server|serve|runserver|watch|nodemon|live-server|uvicorn|gunicorn|vite)\b|--port\b|--watch\b|"
+                         r"http\.server|webpack-dev-server|flask run|tail -f|(?:npm|pnpm|yarn)(?: run)? (?:dev|start)\b", re.I)
+RE_OUT_FILE = re.compile(r"Output is being written to: (.+?\.output)")
+RE_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 # 对话里的进度标记：单独一行「进度 2/5 · 这一步在做什么」，取最后一个
 RE_MARK = re.compile(r"^[ \t>*_`#\-]*进度\s*[:：]?\s*(\d{1,3})\s*/\s*(\d{1,3})[ \t]*(?:[·•\-—–:：,，|][ \t]*)?(.*)$", re.M)
@@ -94,6 +102,22 @@ def describe(name, inp):
         parts = name.split("__")
         return "调用 %s：%s" % (parts[1], parts[-1])
     return name
+
+
+def out_tail(path):
+    """后台命令输出文件的最后一行（去掉颜色控制符；进度条用 \\r 刷新的，取最后刷出来的那一截）。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - OUT_TAIL))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(data.splitlines()):
+        line = RE_ANSI.sub("", line.rsplit("\r", 1)[-1]).strip()
+        if line:
+            return line[:200]
+    return ""
 
 
 def launch_root(cwd, folder):
@@ -321,6 +345,8 @@ class Session(Track):
         self.job_ts = None    # 最近一次用户发话的时间
         self.signals = {}     # 子 agent id -> (结果, 时间)
         self.subs = {}
+        self.launching = {}   # 刚发出去的后台命令：tool_use_id -> (说明, 命令)，等工具结果给出任务编号
+        self.bg = {}          # 还在跑的后台命令：任务编号 -> {desc, start, out 输出文件, resident 常驻的}；跨回合，收到结束通知才划掉
 
     def scan_subs(self):
         since = (self.job_ts or self.last_ts or time.time()) - 60
@@ -383,16 +409,49 @@ class Session(Track):
             if e.get("subtype") == "stop_hook_summary" and self.active:
                 self.finish(stamp, "done")
         elif kind == "assistant" and isinstance(msg, dict):
+            for b in msg.get("content") or []:   # 放到后台跑的命令：先记下说明和命令，工具结果里才有任务编号
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in BG_TOOLS:
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    if inp.get("run_in_background"):
+                        self.launching[b.get("id")] = (str(inp.get("description") or first_line(inp.get("command") or "")),
+                                                       str(inp.get("command") or ""))
             self.on_assistant(e, msg, stamp)
         elif kind == "user" and isinstance(msg, dict):
             self.on_user(e, msg.get("content"), stamp)
+        elif kind == "attachment" and isinstance(e.get("attachment"), dict):
+            self.on_task_status(e["attachment"], stamp)
+
+    def add_bg(self, tid, desc, command, out, stamp):
+        self.bg[tid] = {"desc": desc or tid, "start": stamp or self.last_ts, "out": out or "",
+                        "resident": bool(RE_RESIDENT.search(desc + "\n" + command))}
+
+    def on_task_status(self, att, stamp):
+        """对话压缩后会把还在跑的后台任务重新列一遍（task_status）：悬浮窗中途才打开、没看到起命令那一下的，靠它补上。"""
+        tid = att.get("taskId")
+        if att.get("type") != "task_status" or att.get("taskType") != "local_bash" or not tid:
+            return
+        if att.get("status") != "running":
+            self.bg.pop(tid, None)
+        elif tid not in self.bg:
+            shell = att.get("shell") if isinstance(att.get("shell"), dict) else {}
+            self.add_bg(tid, str(att.get("description") or ""), str(shell.get("command") or ""), att.get("outputFilePath"), stamp)
 
     def on_user(self, e, content, stamp):
         if self.on_results(content):
-            # 前台子 agent：Agent 工具的结果回来就是它干完了
             res = e.get("toolUseResult")
+            # 前台子 agent：Agent 工具的结果回来就是它干完了
             if isinstance(res, dict) and res.get("agentId") and res.get("status") not in (None, "async_launched"):
                 self.signals[res["agentId"]] = (NOTE_KIND.get(res["status"], "interrupted"), stamp or self.last_ts)
+            # 后台命令起来了：工具结果里给了任务编号，输出文件的位置写在结果的文字里
+            if isinstance(res, dict) and res.get("backgroundTaskId"):
+                for b in content:
+                    if isinstance(b, dict) and b.get("tool_use_id") in self.launching:
+                        desc, command = self.launching.pop(b["tool_use_id"])
+                        said = b.get("content")
+                        said = said if isinstance(said, str) else " ".join(
+                            x.get("text") or "" for x in said or [] if isinstance(x, dict))
+                        found = RE_OUT_FILE.search(said)
+                        self.add_bg(res["backgroundTaskId"], desc, command, found.group(1) if found else "", stamp)
             return
         if isinstance(content, str):
             text = content
@@ -406,6 +465,7 @@ class Session(Track):
             m = RE_NOTE.search(text)
             if m:
                 self.signals[m.group(1)] = (NOTE_KIND.get(m.group(2), "interrupted"), stamp or self.last_ts)
+                self.bg.pop(m.group(1), None)
         elif text.startswith("[Request interrupted"):
             self.finish(stamp, "interrupted")
             return
@@ -421,14 +481,34 @@ class Session(Track):
         self.phase = "think"
         self.resume()
 
-    def view(self, now):
+    def bg_view(self, ignored):
+        """还在跑的后台命令（用户说过「不用等」的不算）：输出文件最后动的时间和最后一行，文件没动就不重读。"""
+        out = []
+        for tid, b in self.bg.items():
+            if tid in ignored:
+                continue
+            try:
+                moved = os.path.getmtime(b["out"]) if b["out"] else b["start"]
+            except OSError:
+                moved = b["start"]
+            if b.get("_moved") != moved:
+                b["_moved"], b["_tail"] = moved, out_tail(b["out"]) if b["out"] else ""
+            out.append({"id": tid, "desc": b["desc"], "start": b["start"], "moved": max(moved, b["start"]),
+                        "tail": b["_tail"], "resident": b["resident"]})
+        return sorted(out, key=lambda b: b["start"])
+
+    def view(self, now, ignored=()):
+        """ignored：用户在右键菜单里说过「不用等后台了」的后台命令 / 子 agent 编号，不再因为它们算「等后台」。"""
         subs = []
         for s in self.subs.values():
             v = s.view(now, self.signals.get(s.aid))
             if v["state"] == "run" or (self.job_ts and v["start"] >= self.job_ts - 5):
                 subs.append(v)
         subs.sort(key=lambda v: v["start"])
-        last = max([self.last_ts] + [v["last"] for v in subs])
+        bg = self.bg_view(ignored)
+        waiting = [b for b in bg if not b["resident"]]
+        running = [v for v in subs if v["state"] == "run" and v["id"] not in ignored]
+        last = max([self.last_ts] + [v["last"] for v in subs] + [b["moved"] for b in waiting])
         calls = list(self.pending.values())
         quiet = now - last
         action = ""
@@ -442,8 +522,15 @@ class Session(Track):
                 state, action = "confirm", "可能在等你点确认 · " + calls[0][1]
             else:
                 state, action = "run", self.doing()
-        elif any(v["state"] == "run" for v in subs):
-            state, action = "subs", "等子 agent 干完"
+        elif waiting and quiet > STALE_TOOL:   # 对话被关掉时后台命令跟着没了，不会有结束通知
+            state, action = "stale", "后台可能已经停了，%d 分钟没动静" % (quiet // 60)
+        elif waiting or running:   # 这一轮说完了，但后台还有活：等它们结束会自己接着干，不算完成
+            if waiting and running:
+                state, action = "bg", "等后台：%d 个命令、%d 个子 agent" % (len(waiting), len(running))
+            elif waiting:
+                state, action = "bg", "等后台命令：" + waiting[0]["desc"] + ("（共 %d 个）" % len(waiting) if len(waiting) > 1 else "")
+            else:
+                state, action = "bg", "等子 agent 干完"
         else:
             state = self.end_kind or "done"
         start = self.job_ts or self.start_ts or last
@@ -464,6 +551,7 @@ class Session(Track):
             "start": start, "end": self.end_ts or last, "last": last,
             "timed": bool(self.job_ts),   # 读到了这次任务开始的那句话，用时才算得准
             "subs": subs,
+            "bg": bg,   # 还在跑的后台命令（常驻的也在里面，resident 为真）
         }
 
 
@@ -533,7 +621,7 @@ def placeholder(sid, task, reg, now):
         "ws_color": ws["color"] if ws else workspaces.PALETTE[0], "owned": True,
         "state": "run", "action": "正在启动…", "steps": 0, "root": task["ws"],
         "line": "任务：" + first_line(task["prompt"]), "prompt": task["prompt"], "last_text": "", "marker": None,
-        "start": task["created"], "end": now, "last": now, "subs": [],
+        "start": task["created"], "end": now, "last": now, "subs": [], "bg": [],
     }
 
 
@@ -591,6 +679,7 @@ class Collector:
         self.owned = {}      # 悬浮窗自己发起的后台任务：会话 id -> 项目路径（发起时就定了，不用猜）
         self.pinned = {}     # 从悬浮窗选了编辑器窗口发起的对话：会话 id -> 发起时选的项目路径
         self.assigned = {}   # 用户在右键菜单里手动指定的：会话 id -> 项目路径（不管碰了什么文件，一律按它算）
+        self.ignored = set()   # 用户说过「不用等后台了」的后台命令 / 子 agent 编号
         self.running = {}    # 其中进程还活着的：会话 id -> 这一轮是什么时候起的
         self.exited = {}     # 其中进程已经没了的：会话 id -> (done / error / interrupted, 时间)
         self.sessions = {}
@@ -667,7 +756,7 @@ class Collector:
         live, rest = [], []
         for path, s in list(self.sessions.items()):
             s.pump()
-            v = s.view(now)
+            v = s.view(now, self.ignored)
             self.place(v)
             if v["state"] in LIVE:
                 live.append(v)

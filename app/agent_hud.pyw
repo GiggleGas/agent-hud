@@ -44,7 +44,7 @@ import web  # noqa: E402
 import workspaces  # noqa: E402
 from collector import LIVE  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 NAME = "Agent 悬浮窗"
 CONFIG = os.path.join(install.TARGET, "config.json")   # 脚本版和 exe 版共用同一份设置
 LOG = os.path.join(install.TARGET, "hud.log")
@@ -97,7 +97,7 @@ KEY = "#010203"          # 这个颜色的像素是透明的，用来做圆角
 C = {
     "panel": "#15171c", "edge": "#30343f", "card": "#1e2129", "track": "#383d4a",
     "text": "#e8eaf0", "dim": "#9aa1b0", "faint": "#636a79",
-    "run": "#4c9aff", "subs": "#8b7bff", "ask": "#f5a623", "confirm": "#f5a623",
+    "run": "#4c9aff", "bg": "#8b7bff", "ask": "#f5a623", "confirm": "#f5a623",
     "done": "#3ecf8e", "error": "#ef5350", "interrupted": "#7a8191", "stale": "#7a8191",
 }
 TRAY_COLORS = {"idle": C["faint"], "run": C["run"], "ask": C["ask"], "done": C["done"]}   # 标题栏的点和托盘图标的颜色
@@ -185,17 +185,17 @@ def demo_views(now):
         return {"id": desc, "desc": desc, "state": state, "action": action, "steps": steps,
                 "start": now - age, "end": now - 60, "last": now}
 
-    def ses(title, ws, state, action, line, age, steps, marker=None, subs=(), ended=0, owned=False):
+    def ses(title, ws, state, action, line, age, steps, marker=None, subs=(), ended=0, owned=False, bg=()):
         color = colors.setdefault(ws, workspaces.PALETTE[len(colors) % len(workspaces.PALETTE)])
         return {"id": title, "title": title, "ws": ws, "ws_color": color, "ws_path": "", "root": "", "owned": owned,
                 "state": state, "action": action, "line": line, "prompt": title, "last_text": line,
-                "marker": marker, "steps": steps, "subs": list(subs),
+                "marker": marker, "steps": steps, "subs": list(subs), "bg": list(bg),
                 "start": now - age - ended, "end": now - ended, "last": now - ended}
 
     return [
         ses("订单导出改成后台任务", "shop-server", "run", "跑命令：跑导出模块的单元测试",
             "", 754, 38, marker=(3, 6, "补单元测试")),
-        ses("六个设置页迁到新组件库", "web-admin", "subs", "等子 agent 干完",
+        ses("六个设置页迁到新组件库", "web-admin", "bg", "等子 agent 干完",
             "六个页面的改法写好了，已经分给 6 个子 agent 并行改，改完我逐页对截图验收。", 1385, 21, subs=[
                 sub("Migrate profile page", "done", "", 960, 88),
                 sub("Migrate billing page", "done", "", 955, 74),
@@ -204,6 +204,10 @@ def demo_views(now):
                 sub("Migrate webhooks page", "error", "", 940, 12),
                 sub("Migrate audit log page", "run", "思考中", 300, 9),
             ]),
+        ses("压测回调接口", "pay-gateway", "bg", "等后台命令：跑 400 轮压测",
+            "压测脚本起在后台了，跑完我看超时分布。", 520, 14, bg=[
+                {"id": "b1", "desc": "跑 400 轮压测", "start": now - 260, "moved": now - 2, "tail": "[312/400] p99 182ms，超时 0", "resident": False},
+                {"id": "b2", "desc": "Run the mock bank server", "start": now - 500, "moved": now - 400, "tail": "", "resident": True}]),
         ses("排查支付回调偶发超时", "pay-gateway", "run", "读文件：callback_handler.py",
             "日志里超时都集中在整点，先看定时任务和回调有没有抢同一个连接池。", 190, 12, owned=True),
         ses("登录接口加图形验证码", "shop-server", "ask", "在问你问题，等你回答",
@@ -242,7 +246,8 @@ class Hud:
                     "update_pending": "",   # 一键更新正在更新到的版本（重启后核对成没成）
                     "hidden": False,     # 藏在托盘里没有（下次启动接着藏）
                     "pinned": {},        # 选了窗口发起的对话：会话 id -> 发起时选的项目路径（窗口开的可能是项目的上级文件夹）
-                    "assigned": {}}      # 右键「归到项目」手动指定的：会话 id -> 项目路径（盖过自动判断）
+                    "assigned": {},      # 右键「归到项目」手动指定的：会话 id -> 项目路径（盖过自动判断）
+                    "bg_ignored": []}    # 右键「不用等后台了」的后台命令 / 子 agent 编号（不再因为它们算「等后台」）
         if not (self.demo or self.shot):
             os.makedirs(install.TARGET, exist_ok=True)
             try:
@@ -252,6 +257,7 @@ class Hud:
                 pass
         self.views = []
         self.history = []               # 最近几天、现在没在跟踪的对话
+        self.quiet = {}                 # 用户刚点了「不用等后台了」的对话 -> 点的时间：随后那次「结束」不闪光、不推送、不进「已结束」
         self.scroll = 0                 # 列表往上滚了多少（100% 缩放下的像素）
         self.last_hit = None            # 上一次单击点中的东西（分辨「双击」和「快速点了两个不同的东西」）
         self.recent_all = False         # 「最近 24 小时」里是不是全部显示（否则只显示前 RECENT_ROWS 条）
@@ -440,6 +446,7 @@ class Hud:
                 self.runner.tick()
                 col.owned, col.running, col.exited = self.runner.owned(), self.runner.active(), dict(self.runner.exited)
                 col.pinned, col.assigned = dict(self.cfg["pinned"]), dict(self.cfg["assigned"])
+                col.ignored = set(self.cfg["bg_ignored"])
                 views = col.poll()
                 starting = self.runner.starting({v["id"] for v in views})
                 if starting:   # 刚起的任务还没有会话记录：先顶一张「正在启动」，并且每轮都重新找文件，不等 5 秒一次的扫描
@@ -468,6 +475,8 @@ class Hud:
             v = collector.placeholder(v["id"], dict({"ws": "", "prompt": "", "created": now}, **task), self.reg, now)
             v.update(state="error", title="没跑起来：" + v["title"], last_text=reason)
             kind = "finished"
+        if kind == "finished" and time.time() - self.quiet.pop(v["id"], 0) < 30:   # 用户自己说了不用等，这次结束不用再提醒他
+            return
         if kind == "finished":
             key = "%s@%d" % (v["id"], v["end"])
             if key not in self.cfg["seen"]:
@@ -634,10 +643,22 @@ class Hud:
         m.add_command(label="在编辑器里打开", command=lambda: self.open_session(sid))
         if v.get("owned") and v["state"] in LIVE:
             m.add_command(label="停止这个后台任务…", command=lambda: self.stop_task(sid))
+        if v["state"] == "bg":
+            m.add_command(label="不用等后台了", command=lambda: self.stop_waiting(sid, v))
         if any(u["id"] == sid for u in self.unread):
             m.add_command(label="标为已读", command=lambda: self.mark_read(sid))
         m.add_cascade(label="归到项目", menu=self.assign_menu(m, sid, v))
         m.tk_popup(e.x_root, e.y_root)
+
+    def stop_waiting(self, sid, v):
+        """「不用等后台了」：这一轮已经说完、后台还开着的东西用户不在乎了（比如开着的服务器没被认出来），当场算完成。
+        后台的东西照样跑着，只是悬浮窗不再等它；以后再起的后台命令照常等。"""
+        ids = [b["id"] for b in v.get("bg") or [] if not b["resident"]] + [s["id"] for s in v["subs"] if s["state"] == "run"]
+        self.cfg["bg_ignored"] = (self.cfg["bg_ignored"] + [i for i in ids if i not in self.cfg["bg_ignored"]])[-300:]
+        self.quiet[sid] = time.time()
+        log("不用等后台了：%s（%s）" % (sid, "、".join(ids)))
+        self.save()
+        self.render()
 
     def assign_menu(self, parent, sid, v):
         """「归到项目」子菜单：清单里的每个项目一项（当前归属打勾）；「选别的文件夹…」= 清单里没有的；
@@ -1246,6 +1267,8 @@ class Hud:
                   self.f_small, color if waiting else C["dim"])
         y += 19
 
+        if v.get("bg"):
+            y = self.bgs(v["bg"], ix0, ix1, y + 3, now)
         subs = v["subs"]
         if subs:
             y = self.subs(subs, ix0, ix1, y + 3, now)
@@ -1255,6 +1278,34 @@ class Hud:
             if item >= back:
                 self.c.addtag_withtag("open:" + v["id"], item)
         return y + 6
+
+    def bgs(self, bg, x0, x1, y, now):
+        """卡片上的后台命令：在等的一个一行（说明、跑了多久，下面一行是输出的最后一行）；常驻的（服务器）合成一行「后台开着」。"""
+        waiting = [b for b in bg if not b["resident"]]
+        resident = [b for b in bg if b["resident"]]
+        self.c.create_line(x0, y, x1, y, fill=C["track"])
+        y += 5
+        for b in waiting[:MAX_SUB]:
+            elapsed = fmt_dur(now - b["start"])
+            self.text(x0, y + 9, "◐", self.f_small, C["bg"])
+            self.text(x1, y + 9, elapsed, self.f_small, C["faint"], anchor="e")
+            self.text(x0 + 13, y + 9, self.fit(b["desc"], self.f_small, x1 - x0 - 21 - self.width(elapsed, self.f_small)),
+                      self.f_small, C["text"])
+            y += 18
+            if b["tail"]:
+                self.text(x0 + 13, y + 7, self.fit("输出：" + b["tail"], self.f_small, x1 - x0 - 13), self.f_small, C["dim"])
+                y += 16
+        if len(waiting) > MAX_SUB:
+            self.text(x0 + 13, y + 9, "…还有 %d 个后台命令" % (len(waiting) - MAX_SUB), self.f_small, C["faint"])
+            y += 18
+        if resident:
+            head = "后台开着"
+            self.text(x0, y + 9, head, self.f_small, C["faint"])
+            hw = self.width(head, self.f_small)
+            self.text(x0 + hw + 8, y + 9, self.fit("、".join(b["desc"] for b in resident), self.f_small, x1 - x0 - hw - 8),
+                      self.f_small, C["faint"])
+            y += 18
+        return y
 
     def subs(self, subs, x0, x1, y, now):
         running = [s for s in subs if s["state"] == "run"]
@@ -1309,7 +1360,7 @@ class Hud:
         c.create_rectangle(x0, y0, x1, y1, fill=C["track"], outline="")
         if m:                     # 步数太多画不成格子，就画成一条
             c.create_rectangle(x0, y0, x0 + (x1 - x0) * (m[0] - 0.5) / m[1], y1, fill=color, outline="")
-        elif v["state"] in ("ask", "confirm"):
+        elif v["state"] in ("ask", "confirm", "bg"):   # 在等（等你 / 等后台）：不画「还在动」的滑块
             c.create_rectangle(x0, y0, x1, y1, fill=mix(C["track"], color, 0.55), outline="")
         else:                     # 不知道一共几步：只表示“还在动”
             item = c.create_rectangle(x0, y0, x0, y1, fill=color, outline="")
@@ -1322,9 +1373,9 @@ class Hud:
         state = v["state"] if v["state"] in C else "stale"
         live = state in LIVE
         if live:
-            mark = "●"
+            mark = "◐" if state == "bg" else "●"
             m = v.get("marker")
-            right = ("第 %d/%d 步" % tuple(m[:2]) if m else {"ask": "等你回答", "confirm": "可能等你确认", "subs": "等子 agent"}.get(state, "在跑"))
+            right = ("第 %d/%d 步" % tuple(m[:2]) if m else {"ask": "等你回答", "confirm": "可能等你确认", "bg": "等后台"}.get(state, "在跑"))
             right += " · " + fmt_dur(now - v["start"])
         elif state == "done":
             mark, right = "✓", fmt_ago(now - v["end"])
@@ -1346,6 +1397,8 @@ class Hud:
             x = self.chip(x, y + 10, v["ws"], v["ws_color"], C["panel"], maxw=110, tags=tag) + 6
         if v.get("owned"):
             x = self.chip(x, y + 10, "后台", C["dim"], C["panel"], tags=tag) + 6
+        if not live and any(b["resident"] for b in v.get("bg") or []):   # 做完了，但它开的服务器还在后台开着
+            x = self.chip(x, y + 10, "后台开着", C["bg"], C["panel"], tags=tag) + 6
         self.text(x, y + 10, self.fit(v["title"], self.f_small, x1 - x - 10 - self.width(right, self.f_small)),
                   self.f_small, C["text"] if new or live else C["dim"], tags=tag)
         return y + 21

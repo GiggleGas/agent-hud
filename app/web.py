@@ -97,6 +97,7 @@ class Web:
         return {"id": v["id"], "title": v["title"], "ws": v["ws"], "color": v["ws_color"], "state": v["state"],
                 "owned": bool(v.get("owned")), "new": v["id"] in unread, "marker": list(m) if m else None,
                 "action": v.get("action") or v.get("line") or "",
+                "bg": [{k: b[k] for k in ("desc", "start", "tail", "resident")} for b in v.get("bg") or []],   # 还在跑的后台命令
                 "start": v["start"], "end": v["end"], "when": self.hud.when(v)}
 
     def state(self):
@@ -312,8 +313,9 @@ main{padding:10px 12px 120px}.empty{color:var(--faint);padding:24px 6px}
 <div class="tabs" id="tabs"><button data-t="recent">最近 24 小时</button><button data-t="projects">按项目</button></div></header>
 <main id="main"><div class="empty">正在连接电脑…</div></main>
 <script>
-const C={run:'var(--run)',subs:'#8b7bff',ask:'var(--ask)',confirm:'var(--ask)',done:'var(--done)',error:'var(--err)',interrupted:'#7a8191',stale:'#7a8191'};
-const MARK={done:'✓',error:'✕',interrupted:'■',stale:'…'};
+const C={run:'var(--run)',bg:'#8b7bff',ask:'var(--ask)',confirm:'var(--ask)',done:'var(--done)',error:'var(--err)',interrupted:'#7a8191',stale:'#7a8191'};
+const MARK={bg:'◐',done:'✓',error:'✕',interrupted:'■',stale:'…'};
+const LIVE=['run','bg','ask','confirm'];
 let S=null,tab=localStorage.getItem('tab')||'recent',open=JSON.parse(localStorage.getItem('open')||'{}'),conv=null,job=null,draft='';
 const $=s=>document.querySelector(s);
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -322,16 +324,19 @@ function md(t){const parts=String(t).split('```');return parts.map((p,i)=>i%2?'<
 function dur(s){s=Math.max(0,s|0);return s>=3600?`${s/3600|0}:${String((s%3600)/60|0).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`:`${s/60|0}:${String(s%60).padStart(2,'0')}`}
 function ago(s){return s<60?'刚刚':s<3600?`${s/60|0} 分钟前`:s<86400?`${s/3600|0} 小时前`:`${s/86400|0} 天前`}
 function chip(name,color){return `<span class="chip" style="color:${color};background:color-mix(in srgb,${color} 18%,transparent)">${esc(name)}</span>`}
-function right(v){const now=S.now;if(['run','subs','ask','confirm'].includes(v.state))return (v.marker?`第 ${v.marker[0]}/${v.marker[1]} 步 · `:'')+dur(now-v.start);
+function right(v){const now=S.now;if(LIVE.includes(v.state))return (v.marker?`第 ${v.marker[0]}/${v.marker[1]} 步 · `:v.state==='bg'?'等后台 · ':'')+dur(now-v.start);
   if(v.state==='done')return ago(now-v.end)+(v.end>v.start?' · 用时 '+dur(v.end-v.start):'');if(v.state==='stale')return '没收尾 · '+ago(now-v.when);
   return (v.state==='error'?'出错了':'被打断')+' · '+ago(now-v.end)}
 function card(v){const m=v.marker,cells=m?Array.from({length:m[1]},(_,i)=>`<i class="${i<m[0]?'d':''}"></i>`).join(''):'';
   const wait=v.state==='ask'||v.state==='confirm';
   return `<div class="card" onclick="go('#/c/${v.id}')"><div class="row"><span class="dot" style="background:${C[v.state]}"></span>${chip(v.ws,v.color)}${v.owned?chip('后台','var(--dim)'):''}<span class="title">${esc(v.title)}</span><span class="faint">${right(v)}</span></div>
   ${m?`<div class="muted" style="color:${C[v.state]}">第 ${m[0]}/${m[1]} 步${m[2]?' · '+esc(m[2]):''}</div>`:''}${m?`<div class="bar">${cells}</div>`:''}
-  <div class="line" style="${wait?'color:var(--ask)':''}">▸ ${esc(v.action)}</div></div>`}
+  <div class="line" style="${wait?'color:var(--ask)':''}">▸ ${esc(v.action)}</div>${bgs(v)}</div>`}
+function bgs(v){const w=(v.bg||[]).filter(b=>!b.resident),r=(v.bg||[]).filter(b=>b.resident);   // 后台命令：在等的带输出的最后一行；常驻的合成一行
+  return w.map(b=>`<div class="line" style="color:var(--text)"><span style="color:${C.bg}">◐</span> ${esc(b.desc)} <span class="faint">${dur(S.now-b.start)}</span>${b.tail?`<br><span class="faint">输出：${esc(b.tail)}</span>`:''}</div>`).join('')
+    +(r.length?`<div class="line faint">后台开着：${esc(r.map(b=>b.desc).join('、'))}</div>`:'')}
 function item(v,withWs){return `<div class="item" onclick="go('#/c/${v.id}')"><div class="row">${v.new?'<span class="new"></span>':''}<span style="color:${C[v.state]}">${MARK[v.state]||'●'}</span>
-  ${withWs?chip(v.ws,v.color):''}${v.owned?chip('后台','var(--dim)'):''}<span class="title" style="${v.new?'':'color:var(--dim)'}">${esc(v.title)}</span><span class="faint">${right(v)}</span></div></div>`}
+  ${withWs?chip(v.ws,v.color):''}${v.owned?chip('后台','var(--dim)'):''}${!LIVE.includes(v.state)&&(v.bg||[]).some(b=>b.resident)?chip('后台开着',C.bg):''}<span class="title" style="${v.new?'':'color:var(--dim)'}">${esc(v.title)}</span><span class="faint">${right(v)}</span></div></div>`}
 function renderList(){const L=S.live,R=S.recent;let h='';
   if(tab==='recent'){h+=L.map(card).join('');if(R.length)h+=`<div class="sec">24 小时内结束 · ${R.length} 条</div><div class="card">`+R.map(v=>item(v,true)).join('')+'</div>';
     if(!L.length&&!R.length)h='<div class="empty">现在没有在跑的，24 小时内也没有结束的对话。</div>'}
@@ -358,9 +363,9 @@ function renderConv(){const v=conv;if(!v){$('#main').innerHTML='<div class="empt
   const atBottom=innerHeight+scrollY>=document.body.scrollHeight-200,first=shownConv!==v.id;shownConv=v.id;
   if(first)note=['',''];
   const msgs=v.messages.map(m=>`<div class="msg ${m.role}">${md(m.text)}${m.steps&&m.steps.length?`<details class="steps"><summary>这一轮中间说的 ${m.steps.length} 段</summary>${m.steps.map(s=>'<div style="margin-top:6px;color:var(--dim)">'+md(s)+'</div>').join('')}</details>`:''}</div>`).join('');
-  const live=['run','subs','ask','confirm'].includes(v.state);
+  const live=LIVE.includes(v.state);
   $('#main').innerHTML=`<button class="back" onclick="go('#/')">‹ 返回</button><div class="row" style="margin:6px 0">${chip(v.ws,v.color)}<span class="title">${esc(v.title)}</span></div>
-  <div class="muted">${live?'● '+esc(v.action||'在跑')+' · '+dur(S.now-v.start):right(v)}</div>${msgs||'<div class="empty">还没有对话内容。</div>'}${ask(v)}`;
+  <div class="muted">${live?(MARK[v.state]||'●')+' '+esc(v.action||'在跑')+' · '+dur(S.now-v.start):right(v)}</div>${live?bgs(v):''}${msgs||'<div class="empty">还没有对话内容。</div>'}${ask(v)}`;
   if(v.state==='ask'){$('.reply')&&$('.reply').remove()}   // 在等你选 / 批准：不给普通的回复框
   else{if(!$('.reply')){document.body.insertAdjacentHTML('beforeend',`<div class="reply"><textarea id="rt" placeholder="回复它…（可以按输入法上的麦克风直接说）"></textarea><div class="row" style="margin-top:6px"><span class="note" id="rn"></span><button class="send" onclick="send()">发送</button></div><div class="${note[0]||'status'}" id="rs">${esc(note[1])}</div></div>`)}
     $('#rn').textContent=v.background?'这是后台任务，回复后它直接接着跑。':'会在电脑上的编辑器（Cursor / VS Code）里替你打进这个对话，电脑要开着、没锁屏。';

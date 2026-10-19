@@ -139,7 +139,10 @@ get("/?k=" + w.key(), phone)
 
 print("== 列表")
 state = json.loads(get("/api/state", phone)[1])
-check("在跑的、24 小时内结束的、按项目、项目清单都有", {"live", "recent", "projects", "workspaces"} <= set(state) and len(state["live"]) == 4, state.keys())
+check("在跑的、24 小时内结束的、按项目、项目清单都有", {"live", "recent", "projects", "workspaces"} <= set(state) and len(state["live"]) == 5, state.keys())
+waits = [x for x in state["live"] if x["state"] == "bg" and x["bg"]]
+check("等后台的带着后台命令：说明、输出的最后一行、是不是常驻的",
+      bool(waits) and {"desc", "start", "tail", "resident"} == set(waits[0]["bg"][0]) and waits[0]["bg"][0]["tail"].startswith("[312/400]"), waits[:1])
 check("24 小时内结束的不含一天以前的", all(state["now"] - v["when"] <= 86400 for v in state["recent"]) and "清理过期的发布分支" in {v["title"] for v in state["recent"]})
 check("每条带项目、颜色、标题，不带摘要", all({"ws", "color", "title", "state"} <= set(v) and "summary" not in v for v in state["recent"]))
 

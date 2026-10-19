@@ -92,7 +92,7 @@ now = time.time()
 v = col.poll(now)[0]
 check("标题", v["title"], "三把枪建模")
 check("启动目录不存在时，它自己算一个项目", v["ws"], "Game")
-check("回合结束但子 agent 在跑 -> subs", v["state"], "subs")
+check("回合结束但子 agent 在跑 -> 等后台", (v["state"], v["action"]), ("bg", "等子 agent 干完"))
 check("进度标记取当前任务里最后一个", v["marker"], (2, 3, "分给子 agent 并行做"))
 check("最近一句话", v["line"], "三个都派出去了，等它们交回来。")
 check("步数只算当前任务", v["steps"], 4)
@@ -128,7 +128,7 @@ check("Edit 卡住 -> confirm", (v["state"], v["action"]), ("confirm", "可能�
 check("答完了：选择题没了", v["question"], None)
 w(main, [{"type": "user", "timestamp": iso(time.time()), "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}])
 v = col.poll(time.time())[0]
-check("打断后子 agent 还在 -> subs", v["state"], "subs")
+check("打断后子 agent 还在 -> 等后台", v["state"], "bg")
 w(main, [dict(user(time.time(), "<task-notification>\n<task-id>aaa3</task-id>\n<status>stopped</status>\n</task-notification>"),
               origin={"kind": "task-notification"}),
          asst(time.time(), [{"type": "text", "text": "都停了。"}], "end_turn")])
@@ -235,6 +235,95 @@ check("开始提问时报一次", kinds(h.update(one("ask"), 121) + h.update(one
 h = hub.Hub()
 h.update([], 1)
 check("第一次看到就已经结束的（跑得很快的后台任务）也会报", kinds(h.update(one("done"), 2) + h.update(one("done"), 6)), [("finished", True)])
+
+# ---------- 后台命令 ----------
+print("== 后台命令：这一轮说完了，后台还在跑")
+bg_root = tempfile.mkdtemp(prefix="agent-hud-bg-")
+collector.PROJECTS = bg_root
+bproj = os.path.join(bg_root, "f--Work-Game")
+os.makedirs(bproj)
+tasks = os.path.join(bg_root, "tasks")
+os.makedirs(tasks)
+
+
+def launched(t, i, tid):   # 照真实记录的样子：编号在 toolUseResult 里，输出文件写在结果的文字里
+    out = os.path.join(tasks, tid + ".output")
+    return {"type": "user", "timestamp": iso(t), "toolUseResult": {"stdout": "", "stderr": "", "interrupted": False, "backgroundTaskId": tid},
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content":
+                        "Command running in background with ID: %s. Output is being written to: %s. You will be notified when it completes." % (tid, out)}]}}
+
+
+def notified(t, tid, status="completed"):
+    return dict(user(t, "<task-notification>\n<task-id>%s</task-id>\n<tool-use-id>x</tool-use-id>\n<status>%s</status>\n"
+                        "<summary>Background command completed (exit code 0)</summary>\n</task-notification>" % (tid, status)),
+                origin={"kind": "task-notification"})
+
+
+bmain = os.path.join(bproj, "sbg.jsonl")
+B0 = time.time() - 120
+w(bmain, [
+    user(B0, "第 7 关调完后再跑 400 趟"),
+    asst(B0 + 1, [tool("b1", "Bash", command="python sim.py --runs 400", description="跑 400 趟模拟", run_in_background=True)]),
+    launched(B0 + 2, "b1", "bx1"),
+    asst(B0 + 3, [tool("b2", "PowerShell", command="node tools/mapview/server.mjs --port 3330", description="Run the map viewer", run_in_background=True)]),
+    launched(B0 + 4, "b2", "bx2"),
+    asst(B0 + 5, [{"type": "text", "text": "模拟起在后台了，跑完我看胜率。"}], "end_turn"),
+])
+with open(os.path.join(tasks, "bx1.output"), "w", encoding="utf-8") as f:
+    f.write("开始\n[1/400]\r[200/400]\r\x1b[32m[312/400] 胜率 41%\x1b[0m\n\n")
+bcol = Collector(workspaces.Registry(os.path.join(bg_root, "ws.json")))
+v = bcol.poll(time.time())[0]
+check("这一轮说完了、后台命令还在跑 -> 等后台，不算完成", (v["state"], v["action"]), ("bg", "等后台命令：跑 400 趟模拟"))
+check("后台命令：说明、输出的最后一行（去掉颜色、进度条取最后刷出来的）、服务器认成常驻的",
+      [(b["desc"], b["tail"], b["resident"]) for b in v["bg"]], [("跑 400 趟模拟", "[312/400] 胜率 41%", False), ("Run the map viewer", "", True)])
+check("等后台算在跑的那一类（不闪光、不推送、不进「已结束」）", v["state"] in collector.LIVE, True)
+check("用户说「不用等了」：当场算完成", bcol.sessions[bmain].view(time.time(), {"bx1"})["state"], "done")
+h = hub.Hub()
+h.update([v], 100)
+check("从在跑变成等后台：不报结束", h.update([v], 101) + h.update([v], 110), [])
+w(bmain, [notified(time.time(), "bx1"), asst(time.time(), [{"type": "text", "text": "跑完了，胜率 41%。"}], "end_turn")])
+v = bcol.poll(time.time())[0]
+check("收到结束通知、接着说完 -> 完成；只剩开着的服务器，不等它", (v["state"], [b["desc"] for b in v["bg"]]), ("done", ["Run the map viewer"]))
+check("等后台结束、真做完了：这时才报结束，要通知", kinds(h.update([v], 111) + h.update([v], 115)), [("finished", True)])
+
+print("== 后台命令：没有结束通知的")
+w(bmain, [user(time.time(), "再跑一次"),
+          asst(time.time(), [tool("b3", "Bash", command="python sim.py", description="再跑一次", run_in_background=True)]),
+          launched(time.time(), "b3", "bx3"), asst(time.time(), [{"type": "text", "text": "起好了。"}], "end_turn")])
+v = bcol.poll(time.time())[0]
+check("新的后台命令：又在等", (v["state"], v["action"]), ("bg", "等后台命令：再跑一次"))
+check("对话被关掉、后台跟着没了：输出和记录都 30 分钟没动静 -> 没收尾",
+      bcol.sessions[bmain].view(time.time() + collector.STALE_TOOL + 60)["state"], "stale")
+with open(os.path.join(tasks, "bx3.output"), "w", encoding="utf-8") as f:
+    f.write("还在输出\n")
+later = time.time() + collector.STALE_TOOL + 60
+os.utime(os.path.join(tasks, "bx3.output"), (later - 30, later - 30))
+check("对话记录没动、但后台还在往输出里写：照样在等", bcol.sessions[bmain].view(later)["state"], "bg")
+w(bmain, [notified(time.time(), "bx3", "killed")])
+bcol.sessions[bmain].pump()
+check("被停掉也算等完了", [b["desc"] for b in bcol.sessions[bmain].view(time.time())["bg"] if not b["resident"]], [])
+
+print("== 后台命令：悬浮窗中途打开（靠压缩后的 task_status 补上）")
+cmain = os.path.join(bproj, "scomp.jsonl")
+C0 = time.time() - 60
+w(cmain, [
+    user(C0, "接着调"),
+    {"type": "attachment", "timestamp": iso(C0 + 1), "attachment": {"type": "task_status", "taskId": "bc1", "taskType": "local_bash",
+     "description": "编译整个工程", "status": "running", "outputFilePath": os.path.join(tasks, "bc1.output"),
+     "shell": {"command": "UnrealBuildTool Game Win64", "kind": "bash"}}},
+    {"type": "attachment", "timestamp": iso(C0 + 1), "attachment": {"type": "task_status", "taskId": "ag1", "taskType": "local_agent",
+     "description": "子 agent 不算在这里", "status": "running"}},
+    asst(C0 + 2, [{"type": "text", "text": "等编译完。"}], "end_turn"),
+])
+bcol.next_scan = 0
+v = next(x for x in bcol.poll(time.time()) if x["id"] == "scomp")
+check("压缩前起的后台命令：从 task_status 认出来", (v["state"], [b["desc"] for b in v["bg"]]), ("bg", ["编译整个工程"]))
+w(cmain, [{"type": "attachment", "timestamp": iso(time.time()), "attachment": {"type": "task_status", "taskId": "bc1",
+           "taskType": "local_bash", "description": "编译整个工程", "status": "completed"}}])
+v = next(x for x in bcol.poll(time.time()) if x["id"] == "scomp")
+check("task_status 说结束了：划掉", (v["state"], v["bg"]), ("done", []))
+collector.PROJECTS = root
+shutil.rmtree(bg_root, ignore_errors=True)
 
 shutil.rmtree(root, ignore_errors=True)
 print("\n失败 %d 项" % len(fails) if fails else "\n全部通过")
