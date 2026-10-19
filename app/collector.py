@@ -631,6 +631,13 @@ def placeholder(sid, task, reg, now):
     }
 
 
+def session_files():
+    """Keep each provider's rollout parser separate."""
+    from codex_collector import CodexSession, session_files as codex_files
+    return ([(p, Session) for p in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))]
+            + [(p, CodexSession) for p in codex_files()])
+
+
 class History:
     """最近几天的对话（不管现在还跟不跟踪），给按项目的列表看历史用。
     每个文件只读最后一段，按修改时间缓存：文件没动过就不再读。"""
@@ -650,7 +657,7 @@ class History:
             return self.copies(skip)
         self.next = now + self.EVERY
         items, cache = [], {}
-        for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        for path, session_type in session_files():
             try:
                 mtime = os.path.getmtime(path)
             except OSError:
@@ -662,7 +669,7 @@ class History:
                 v = old[1]
             else:
                 try:
-                    s = Session(path, self.reg, tail=self.TAIL)
+                    s = session_type(path, self.reg, tail=self.TAIL)
                     Track.pump(s)
                     v = s.view(now) if s.last_ts else None   # 只有标题之类、没有一句对话的文件不算
                 except (OSError, ValueError):
@@ -676,7 +683,10 @@ class History:
     def copies(self, skip):
         """给出去的都是副本：外面会按发起方式、手动指定改项目，不能改到缓存里（不然撤掉手动指定也改不回来）。
         真正在干活的对话都在 skip 里（Collector 跟踪着）；剩下看着还在干活的，是停在半截没收尾的。"""
-        return [dict(v, state="stale") if v["state"] in LIVE else dict(v) for v in self.items if v["id"] not in skip]
+        from codex_collector import group_views
+        views = group_views(self.items)
+        return [dict(v, state="stale") if v["state"] in LIVE else dict(v)
+                for v in views if v["id"] not in skip and v.get("parent_id") not in skip]
 
 
 class Collector:
@@ -693,28 +703,45 @@ class Collector:
 
     def scan(self, now):
         cutoff = now - TRACK_WINDOW
-        recent = set()
-        for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        recent = {}
+        files = session_files()
+        for path, session_type in files:
             try:
-                if os.path.getmtime(path) >= cutoff:
-                    recent.add(path)
+                if (os.path.getmtime(path) >= cutoff
+                        or session_type is not Session and session_type.recently_active(path, cutoff)):
+                    recent[path] = session_type
             except OSError:
                 pass
         # 主会话在等一个跑很久的子 agent 时，自己的记录不动，靠子 agent 的记录把它找出来
         for sub in glob.glob(os.path.join(PROJECTS, "*", "*", "subagents", "agent-*.jsonl")):
             try:
                 if os.path.getmtime(sub) >= cutoff:
-                    recent.add(os.path.dirname(os.path.dirname(sub)) + ".jsonl")
+                    recent[os.path.dirname(os.path.dirname(sub)) + ".jsonl"] = Session
             except OSError:
                 pass
-        for path in recent:
+        for path, session_type in recent.items():
             if path not in self.sessions and os.path.isfile(path):
                 try:
-                    s = Session(path, self.reg)
+                    s = session_type(path, self.reg)
                     Track.pump(s)
                     self.sessions[path] = s
                 except OSError:
                     pass
+        # A running child can keep a parent alive after its own rollout stops changing.
+        known = {s.sid for s in self.sessions.values()}
+        pending = list(self.sessions.values())
+        while pending:
+            parent = getattr(pending.pop(), "parent_sid", None)
+            if not parent or parent in known:
+                continue
+            match = next(((p, cls) for p, cls in files if p.endswith(parent[6:] + ".jsonl")), None)
+            if match:
+                path, session_type = match
+                s = session_type(path, self.reg)
+                Track.pump(s)
+                self.sessions[path] = s
+                known.add(s.sid)
+                pending.append(s)
         for s in self.sessions.values():
             s.scan_subs()
 
@@ -760,9 +787,17 @@ class Collector:
             self.scan(now)
             self.next_scan = now + RESCAN
         live, rest = [], []
+        from codex_collector import group_views
+        raw_views, paths, expired_children = [], {}, []
         for path, s in list(self.sessions.items()):
             s.pump()
             v = s.view(now, self.ignored)
+            raw_views.append(v)
+            paths[v["id"]] = path
+            if getattr(s, "parent_sid", None) and v["state"] not in LIVE and now - v["last"] > TRACK_WINDOW:
+                expired_children.append(path)
+        for v in group_views(raw_views):
+            path = paths[v["id"]]
             self.place(v)
             if v["state"] in LIVE:
                 live.append(v)
@@ -777,6 +812,8 @@ class Collector:
                 del self.sessions[path]
         live.sort(key=lambda v: v["start"])
         rest.sort(key=lambda v: -v["end"])
+        for path in expired_children:
+            self.sessions.pop(path, None)
         return live + rest
 
 

@@ -1,6 +1,6 @@
 # Agent 悬浮窗
 
-Windows 上的一个置顶小窗口，显示本机每个 Claude Code 对话和它派出去的子 agent 在干什么、进度到哪、属于哪个项目。可以从它发起任务、跳到编辑器里的对话、用手机看进度和回复，有新版本时一键更新。
+Windows 上的一个置顶小窗口，在同一个 `Agent悬浮窗.exe` 中显示本机 Claude Code 和 Codex 对话的状态、子任务进度和所属项目。Claude Code 保留发起任务、跳转编辑器和手机回复功能，有新版本时一键更新。
 
 ![悬浮窗示意](预览.png)
 
@@ -20,7 +20,9 @@ Windows 上的一个置顶小窗口，显示本机每个 Claude Code 对话和�
 ## 测试
 
 `dev/test_*.py` 每个都能单独跑（`python dev/test_collector.py`），最后一行是「全部通过」或者失败了哪几项。
-测试都在临时目录里跑，不碰本机的设置；`test_exe.py` 要先打好 exe。
+测试都在临时目录里跑，不碰本机的设置；`test_exe.py` 和 `test_codex_exe.py` 要先打好 exe。
+
+`dev/test_codex.py` 覆盖两类会话混合显示、Codex 父子任务合并、桌面已读同步和旧缓存恢复。Codex 读取逻辑在 `app/codex_collector.py`，与 Claude Code 共用原来的列表、设置、安装入口和打包流程。
 
 ## 打包、发版
 

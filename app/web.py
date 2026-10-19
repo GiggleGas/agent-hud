@@ -120,6 +120,8 @@ class Web:
         v = self.hud.find(sid)
         if not v:
             return None
+        if sid.startswith("codex:"):
+            return None
         self.hud.events.put(("read", {"id": sid}, False))   # 在手机上看过了，就算已读
         out = self.item(v, set())
         out["messages"] = collector.conversation(sid)
@@ -150,6 +152,8 @@ class Web:
 
     def reply(self, sid, text, tool_id=None):
         """回复一句话；tool_id 不为空表示这是在回答那道选择题。"""
+        if sid.startswith("codex:"):
+            raise ValueError("Codex 目前仅支持在悬浮窗中查看状态，请在 Codex 中回复。")
         job = uuid.uuid4().hex[:8]
         self.jobs[job] = {"state": "sending", "message": "正在发送…"}
 
