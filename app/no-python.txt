@@ -1,0 +1,10 @@
+
+没找到可用的 Python。
+
+Agent 悬浮窗需要 Python 3.8 或更高版本，并且要带 tkinter（python.org 的安装包默认就带）。
+
+装法二选一：
+  1. 打开 https://www.python.org/downloads/ 下载安装，安装选项保持默认。
+  2. 在命令行里运行：winget install -e --id Python.Python.3.12
+
+装好以后，重新双击「安装.bat」。

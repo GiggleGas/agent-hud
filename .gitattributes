@@ -1,0 +1,5 @@
+# 换行固定下来，不跟着各人的 core.autocrlf 变：批处理必须是 CRLF（cmd 才认），其余 LF（和磁盘上的一样）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.ico binary

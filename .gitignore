@@ -1,0 +1,15 @@
+# 作者的群机器人地址、飞书应用密钥、发版表地址：只打进发给同事的包里，不进仓库（模板见 dev/feedback_to_example.py）
+app/feedback_to.py
+
+# 打出来的东西
+Agent悬浮窗.exe
+_internal/
+build/
+dev/.venv-build/
+dev/.exe-test-shot.png
+
+# 本机的设置、日志、缓存
+config.json
+hud.log
+__pycache__/
+*.pyc
