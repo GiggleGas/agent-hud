@@ -2,19 +2,23 @@
 
 1. 被压到普通窗口下面（锁屏、UAC 之后会这样）：一两秒内自己回到最上面。
 2. 跑到屏幕外面：再启动一次，窗口回到右上角；第二个实例自己退出，不会出现两个。
+3. Foreign Tk windows and the glow must not count as duplicate HUDs; real duplicates must still be detected.
 
 python test_window.py           测脚本版
 python test_window.py <exe>     测打好的 exe
 """
-import ctypes, os, shutil, subprocess, sys, tempfile, time
+import ctypes, json, os, shutil, subprocess, sys, tempfile, time
 from ctypes import wintypes
+from datetime import datetime, timezone
+import tkinter as tk
 
 sys.stdout.reconfigure(encoding="utf-8")
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CMD = [sys.argv[1]] if len(sys.argv) > 1 else [sys.executable, os.path.join(ROOT, "app", "agent_hud.pyw")]
 BOX = tempfile.mkdtemp(prefix="agent-hud-window-")
-ENV = dict(os.environ, AGENT_HUD_TEST_ROOT=BOX)
+ENV = dict(os.environ, AGENT_HUD_TEST_ROOT=BOX,
+           CLAUDE_CONFIG_DIR=os.path.join(BOX, ".claude"), CODEX_HOME=os.path.join(BOX, ".codex"))
 u = ctypes.WinDLL("user32")
 u.GetWindow.restype = ctypes.c_void_p
 u.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
@@ -22,6 +26,7 @@ u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 
 u.IsWindowVisible.argtypes = [ctypes.c_void_p]
 u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
 u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
+u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 fails = []
 
 
@@ -31,8 +36,8 @@ def check(name, ok, detail=""):
         fails.append(name)
 
 
-def hud_windows():
-    """现在屏幕上所有的悬浮窗窗口。测试窗口 = 启动之后多出来的那个，正式在跑的那个不会被碰。"""
+def tk_windows():
+    """Return visible Tk handles, process IDs and extended styles for diagnostics."""
     found = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -40,11 +45,18 @@ def hud_windows():
         cls = ctypes.create_unicode_buffer(40)
         u.GetClassNameW(h, cls, 40)
         if cls.value == "TkTopLevel" and u.IsWindowVisible(h):
-            found.append(h)
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            found.append((h, pid.value, u.GetWindowLongW(h, -20)))
         return True
 
     u.EnumWindows(each, 0)
-    return set(found)
+    return found
+
+
+def hud_windows(pid):
+    """Count this process's interactive windows; WS_EX_TRANSPARENT marks the glow."""
+    return {h for h, owner, style in tk_windows() if owner == pid and not style & 0x20}
 
 
 def covered(h):
@@ -63,21 +75,50 @@ def rect(h):
     return r.left, r.top
 
 
-before = hud_windows()
+# A real second window must still be detected. Keep one foreign window alive
+# during the executable test so desktop activity cannot silently affect counts.
+decoy = tk.Tk()
+decoy.attributes("-alpha", 0.0)
+duplicate = tk.Toplevel(decoy)
+duplicate.attributes("-alpha", 0.0)
+decoy.update()
+check("同一进程的两个真正窗口都能检出", len(hud_windows(os.getpid())) == 2, tk_windows())
+duplicate.destroy()
+decoy.update()
+check("关掉第二个窗口后计数恢复为一", len(hud_windows(os.getpid())) == 1, tk_windows())
+
+
+def event(kind, payload):
+    return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "type": kind, "payload": payload}) + "\n"
+
+
+sessions = os.path.join(ENV["CODEX_HOME"], "sessions", "2026", "10", "19")
+os.makedirs(sessions)
+fixture = os.path.join(sessions, "rollout-window.jsonl")
+with open(fixture, "w", encoding="utf-8") as f:
+    f.write(event("session_meta", {"id": "window-test", "cwd": BOX, "source": "cli"}))
+    f.write(event("event_msg", {"type": "task_started"}))
+    f.write(event("event_msg", {"type": "user_message", "message": "window count fixture"}))
+
 T0 = time.time()
-p = subprocess.Popen(CMD + ["--no", "--exit-after", "45"], env=ENV)   # exe 每次启动要解包好几秒，存活期留足
+p = subprocess.Popen(CMD + ["--no", "--exit-after", "45"], env=ENV)
 try:
     h = None
     for _ in range(40):
         time.sleep(0.5)
-        new = hud_windows() - before
+        new = hud_windows(p.pid)
         if new:
             h = new.pop()
             break
-    check("测试窗口起来了", h is not None)
+    check("测试窗口起来了", h is not None, tk_windows())
+    if h is None:
+        raise RuntimeError("No HUD window for process %d" % p.pid)
     print("      启动到出窗口 %.1f 秒" % (time.time() - T0))
     time.sleep(1.5)
     home = rect(h)
+    check("其他进程的 Tk 窗口不计入悬浮窗", hud_windows(p.pid) == {h} and bool(hud_windows(os.getpid())), tk_windows())
+    with open(fixture, "a", encoding="utf-8") as f:
+        f.write(event("event_msg", {"type": "task_complete", "last_agent_message": "done"}))
 
     print("== 被压到普通窗口下面")
     u.SetWindowPos(h, 1, 0, 0, 0, 0, 0x13)   # HWND_BOTTOM：压到最底下，同时丢掉置顶
@@ -96,8 +137,14 @@ try:
     print("      第二次启动到退出 %.1f 秒；此时测试窗口还活着: %s" % (time.time() - t, p.poll() is None))
     time.sleep(2.5)
     check("窗口回到了右上角", rect(h) == home, (rect(h), home))
-    check("仍然只有一个窗口", len(hud_windows() - before) == 1)
+    for _ in range(20):
+        if any(owner == p.pid and style & 0x20 for _, owner, style in tk_windows()):
+            break
+        time.sleep(0.5)
+    check("完成提醒创建了真实的透明扫光层", any(owner == p.pid and style & 0x20 for _, owner, style in tk_windows()), tk_windows())
+    check("扫光层出现后仍然只有一个主窗口", hud_windows(p.pid) == {h}, (p.pid, tk_windows()))
 finally:
+    decoy.destroy()
     p.wait(timeout=60)
     shutil.rmtree(BOX, ignore_errors=True)
 

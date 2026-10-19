@@ -21,6 +21,7 @@ Windows 上的一个置顶小窗口，在同一个 `Agent悬浮窗.exe` 中显�
 
 `dev/test_*.py` 每个都能单独跑（`python dev/test_collector.py`），最后一行是「全部通过」或者失败了哪几项。
 测试都在临时目录里跑，不碰本机的设置；`test_exe.py` 和 `test_codex_exe.py` 要先打好 exe。
+界面测试须依次运行：它们共用测试专用的单实例锁和注册表位置。`test_window.py`（也可传入 exe 路径）检查置顶、移回屏幕、重复启动，并验证其他进程的窗口和完成提醒的透明扫光层不会被误计为重复悬浮窗。
 
 `dev/test_codex.py` 覆盖两类会话混合显示、Codex 父子任务合并、桌面已读同步和旧缓存恢复。Codex 读取逻辑在 `app/codex_collector.py`，与 Claude Code 共用原来的列表、设置、安装入口和打包流程。
 
