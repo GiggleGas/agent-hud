@@ -640,9 +640,9 @@ def is_codex(view):
     return view.get("provider") == "codex" or view.get("id", "").startswith("codex:")
 
 
-def grouped(views, sources):
+def grouped(views, sources, ignored=()):
     for source in sources:
-        views = source.group_views(views)
+        views = source.group_views(views, ignored)
     return views
 
 
@@ -828,7 +828,7 @@ class Collector:
             paths[v["id"]] = path
             if getattr(s, "parent_sid", None) and v["state"] not in LIVE and now - v["last"] > TRACK_WINDOW:
                 expired_children.append(path)
-        for v in grouped(raw_views, self.sources):
+        for v in grouped(raw_views, self.sources, self.ignored):
             path = paths[v["id"]]
             self.place(v)
             if v["state"] in LIVE:

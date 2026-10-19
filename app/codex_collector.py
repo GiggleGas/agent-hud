@@ -97,7 +97,7 @@ def text_content(content):
                      and isinstance(b.get("text", ""), str))
 
 
-def group_views(views):
+def group_views(views, ignored=()):
     """Attach child rollouts to their root conversation without changing cached views."""
     items = {v["id"]: dict(v, subs=list(v["subs"])) for v in views}
     children = set()
@@ -123,8 +123,8 @@ def group_views(views):
             "start": v["start"], "end": v["end"], "last": v["last"],
         })
         parent["last"] = max(parent["last"], v["last"])
-        if v["state"] in LIVE and parent["state"] not in LIVE:
-            parent.update(state="subs", action="等子任务完成")
+        if v["state"] in LIVE and v["id"] not in ignored and parent["state"] not in LIVE:
+            parent.update(state="bg", action="等子任务完成")
     return [v for sid, v in items.items() if sid not in children]
 
 
@@ -285,8 +285,8 @@ class CodexSession(Session):
             if p.get("phase") == "final_answer":
                 self.finish(stamp, "done")
 
-    def view(self, now):
-        v = super().view(now)
+    def view(self, now, ignored=()):
+        v = super().view(now, ignored)
         prefix = "[Codex 子任务] " if self.child else "[Codex] "
         v["title"] = prefix + (session_title(self.sid[6:]) or self.prompt or self.agent_path or "任务")
         v["provider"] = "codex"

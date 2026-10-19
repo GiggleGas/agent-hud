@@ -204,7 +204,7 @@ class CodexTests(unittest.TestCase):
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
             views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
         self.assertEqual(len(views), 1)
-        self.assertEqual((views[0]["id"], views[0]["state"]), ("codex:same-id", "subs"))
+        self.assertEqual((views[0]["id"], views[0]["state"]), ("codex:same-id", "bg"))
         self.assertEqual(views[0]["subs"][0]["state"], "run")
 
     def test_nested_children_share_root(self):
@@ -271,6 +271,7 @@ class CodexTests(unittest.TestCase):
         self.assertFalse(reads.is_read(dict(view, codex_desktop=False)))
         self.assertFalse(reads.is_read(dict(view, read_identity=None)))
         self.assertFalse(reads.is_read(dict(view, state="run")))
+        self.assertFalse(reads.is_read(dict(view, state="bg")))
         path.write_text('{"electron-thread-read-state-v1":{"version":2}}', encoding="utf-8")
         self.assertFalse(reads.is_read(view))
         path.write_text('{"electron-thread-', encoding="utf-8")
@@ -284,7 +285,8 @@ class CodexTests(unittest.TestCase):
         loader.exec_module(module)
         hud = object.__new__(module.Hud)
         hud.unread = []
-        hud.cfg = {"unread": hud.unread, "seen": [], "flash_on_done": True, "notify_url": ""}
+        hud.cfg = {"unread": hud.unread, "seen": [], "flash_on_done": True, "notify_url": "", "bg_ignored": []}
+        hud.quiet = {}
         hud.codex_reads = codex_collector.ReadState()
         hud.views, hud.history = [], []
         hud.events = queue.Queue()
@@ -576,6 +578,73 @@ class CodexTests(unittest.TestCase):
             session.feed(event)
             states.append(session.view(collector.stamp_of(event))["state"])
         self.assertEqual(states, ["run", "ask", "run", "done"])
+
+    def test_codex_view_forwards_ignored_and_preserves_background_fields(self):
+        self.feed(self.event("task_started"), self.event("task_complete"))
+        self.session.add_bg("command-id", "fixture command", "echo fixture", "", self.now)
+        view = self.session.view(self.now)
+        self.assertEqual(view["state"], "bg")
+        self.assertEqual([b["id"] for b in view["bg"]], ["command-id"])
+        ignored = self.session.view(self.now, {"command-id"})
+        self.assertEqual((ignored["state"], ignored["bg"]), ("done", []))
+
+    def test_parent_waiting_in_bg_survives_completion_retention(self):
+        import hub
+        self.now -= collector.TRACK_WINDOW + 60
+        self.write_parent(finished=True)
+        self.now += collector.TRACK_WINDOW + 60
+        self.path.rename(self.path.with_name("rollout-same-id.jsonl"))
+        self.add_child()
+        events = hub.Hub()
+        with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
+            col = collector.Collector(self.reg, sources=(codex_collector,))
+            for now in (self.now, self.now + 1):
+                views = col.poll(now)
+                self.assertEqual([(v["id"], v["state"]) for v in views], [("codex:same-id", "bg")])
+                self.assertIn(views[0]["state"], collector.LIVE)
+                self.assertGreater(now - views[0]["end"], collector.DONE_KEEP)
+                self.assertEqual(views[0]["bg"], [])
+                self.assertEqual(events.update(views, now), [])
+
+    def test_stop_waiting_for_codex_child_is_quiet_and_keeps_child_running(self):
+        self.write_parent(finished=True)
+        child = self.add_child()
+        hud = self.make_hud()
+        with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
+            col = collector.Collector(self.reg, sources=(codex_collector,))
+            waiting = col.poll(self.now)[0]
+            self.assertEqual(waiting["state"], "bg")
+            with patch.object(hud.test_module, "log"):
+                hud.stop_waiting(waiting["id"], waiting)
+            self.assertEqual(hud.cfg["bg_ignored"], ["codex:child"])
+            col.ignored = set(hud.cfg["bg_ignored"])
+            finished = col.poll(self.now + 1)[0]
+            self.assertEqual(finished["state"], "done")
+            self.assertTrue(col.sessions[str(child)].active)
+            with patch.object(hud, "start_flash") as flash:
+                hud.on_event("finished", finished, True)
+                flash.assert_not_called()
+            self.assertEqual(hud.unread, [])
+            self.assertEqual(hud.quiet, {})
+
+    def test_ignored_child_does_not_hide_other_waiting_children(self):
+        self.write_parent(finished=True)
+        self.add_child()
+        self.add_child("second-child")
+        with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
+            col = collector.Collector(self.reg, sources=(codex_collector,))
+            col.ignored = {"codex:child"}
+            self.assertEqual(col.poll(self.now)[0]["state"], "bg")
+            col.ignored.add("codex:second-child")
+            self.assertEqual(col.poll(self.now + 1)[0]["state"], "done")
+
+    def test_worker_passes_ignored_codex_children_to_collector(self):
+        self.write_parent(finished=True)
+        self.add_child()
+        hud = self.make_hud()
+        hud.cfg["bg_ignored"] = ["codex:child"]
+        self.run_worker_once(hud)
+        self.assertEqual([(v["id"], v["state"]) for v in hud.views], [("codex:same-id", "done")])
 
     def test_codex_toggle_preserves_claude_completion_notification(self):
         from types import SimpleNamespace

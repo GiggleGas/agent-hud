@@ -1067,7 +1067,7 @@ class Hud:
             self.anim = [(k, i, [b[0], b[1] - self.scroll, b[2], b[3] - self.scroll] if b else b, x) for k, i, b, x in self.anim]
         self.rr(1, 1, w - 1, 30, 11, fill=C["panel"], outline="")
         c.create_rectangle(1, 14, w - 1, top, fill=C["panel"], outline="")
-        done = [u for u in self.unread if not self.cfg["live_only"]]
+        done = [u for u in self.unread if not self.cfg["live_only"] and self.enabled(u)]
         self.header(w, live, done)
         if self.tray:
             parts, state = self.summary(live, done)

@@ -33,6 +33,25 @@ h.open_session = lambda sid: opened.append(sid)
 h.render()
 h.root.update()
 
+# Capture the actual header inputs so hidden unread tasks cannot affect its count.
+real_header, headers = h.header, []
+def header(w, live, done):
+    headers.append({v["id"] for v in done})
+    return real_header(w, live, done)
+h.header = header
+codex_done = dict(h.history[0], id="codex:hidden", provider="codex")
+h.unread.append(codex_done)
+h.cfg["codex_on"] = False
+h.render()
+check("关闭 Codex 后标题栏不计入它的未读任务", "codex:hidden" not in headers[-1], headers[-1])
+h.cfg["codex_on"] = True
+h.render()
+check("重新开启 Codex 后标题栏恢复未读计数", "codex:hidden" in headers[-1], headers[-1])
+h.header = real_header
+h.unread.remove(codex_done)
+h.render()
+h.root.update()
+
 
 clock = [100000]   # 模拟事件的时间戳（毫秒）：每次单击隔 5 秒，免得被 tkinter 当成双击
 
@@ -40,6 +59,12 @@ clock = [100000]   # 模拟事件的时间戳（毫秒）：每次单击隔 5 �
 def where(tag):
     items = h.c.find_withtag(tag)
     x0, y0, x1, y1 = h.c.bbox(items[-1])   # 最后画的那个在最上面
+    if y1 > h.c.winfo_height() - 12 * h.s:
+        # The expanded list can exceed the viewport; scroll before simulating a click.
+        h.scroll += (y1 - h.c.winfo_height()) / h.s + 24
+        h.render()
+        h.root.update()
+        x0, y0, x1, y1 = h.c.bbox(h.c.find_withtag(tag)[-1])
     x, y = (x0 + x1) // 2, (y0 + y1) // 2
     h.c.event_generate("<Motion>", x=x, y=y, rootx=h.root.winfo_rootx() + x, rooty=h.root.winfo_rooty() + y)
     h.root.update()
