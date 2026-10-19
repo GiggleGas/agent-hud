@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -136,9 +137,9 @@ class CodexTests(unittest.TestCase):
                    "message": {"content": [{"type": "text", "text": "Done"}], "stop_reason": "end_turn"}}]
         (claude_dir / "same-id.jsonl").write_text("".join(json.dumps(e) + "\n" for e in claude), encoding="utf-8")
         with patch.object(collector, "PROJECTS", str(self.base / "claude")):
-            views = collector.Collector(self.reg).poll(self.now)
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
             self.assertEqual({v["id"]: v["state"] for v in views}, {"same-id": "done", "codex:same-id": "run"})
-            past = collector.History(self.reg).recent(set(), self.now)
+            past = collector.History(self.reg, sources=(codex_collector,)).recent(set(), self.now)
             self.assertEqual({v["id"] for v in past}, {"same-id", "codex:same-id"})
 
     def test_no_false_approval_wait(self):
@@ -184,11 +185,11 @@ class CodexTests(unittest.TestCase):
         self.write_parent()
         self.add_child(finished=True)
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
-            col = collector.Collector(self.reg)
+            col = collector.Collector(self.reg, sources=(codex_collector,))
             views = col.poll(self.now)
             self.assertEqual([v["id"] for v in views], ["codex:same-id"])
             self.assertEqual([(v["desc"], v["state"]) for v in views[0]["subs"]], [("child", "done")])
-            history = collector.History(self.reg)
+            history = collector.History(self.reg, sources=(codex_collector,))
             self.assertEqual(history.recent({"codex:same-id"}, self.now), [])
             self.assertEqual([v["id"] for v in history.copies(set())], ["codex:same-id"])
             self.assertEqual(history.cache[str(self.path)][1]["subs"], [])
@@ -201,7 +202,7 @@ class CodexTests(unittest.TestCase):
         parent_path = self.path.with_name("rollout-same-id.jsonl")
         self.path.rename(parent_path)
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
-            views = collector.Collector(self.reg).poll(self.now)
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
         self.assertEqual(len(views), 1)
         self.assertEqual((views[0]["id"], views[0]["state"]), ("codex:same-id", "subs"))
         self.assertEqual(views[0]["subs"][0]["state"], "run")
@@ -211,7 +212,7 @@ class CodexTests(unittest.TestCase):
         self.add_child()
         self.add_child("grandchild", "child")
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
-            views = collector.Collector(self.reg).poll(self.now)
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
         self.assertEqual([v["id"] for v in views], ["codex:same-id"])
         self.assertEqual({s["id"] for s in views[0]["subs"]}, {"codex:child", "codex:grandchild"})
 
@@ -221,7 +222,7 @@ class CodexTests(unittest.TestCase):
         self.add_child(finished=True)
         self.now += 60
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
-            views = collector.Collector(self.reg).poll(self.now)
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
         self.assertEqual(len(views), 1)
         self.assertEqual(views[0]["subs"], [])
 
@@ -374,9 +375,232 @@ class CodexTests(unittest.TestCase):
         self.write_parent()
         os.utime(self.path, (self.now - 4000, self.now - 4000))
         with patch.object(collector, "PROJECTS", str(self.base / "no-claude")):
-            views = collector.Collector(self.reg).poll(self.now)
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
         self.assertEqual([(v["id"], v["state"]) for v in views], [("codex:same-id", "run")])
         self.assertFalse(codex_collector.CodexSession.recently_active(str(self.path), self.now + 1))
+
+    def claude_record(self, finished=None):
+        directory = self.base / "claude/project"
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.fromtimestamp(finished or self.now, timezone.utc).isoformat()
+        messages = [
+            {"timestamp": stamp, "type": "user", "cwd": str(self.base), "origin": {"kind": "human"},
+             "message": {"content": "Claude task"}},
+            {"timestamp": stamp, "type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Claude done"}], "stop_reason": "end_turn"}},
+        ]
+        path = directory / "claude-id.jsonl"
+        path.write_text("".join(json.dumps(e) + "\n" for e in messages), encoding="utf-8")
+        return path
+
+    def check_bad_header_isolated(self, raw):
+        self.write_parent()
+        claude = self.claude_record()
+        bad = self.path.with_name("rollout-bad.jsonl")
+        bad.write_text(raw, encoding="utf-8")
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), patch.object(collector, "log") as log:
+            col = collector.Collector(self.reg, sources=(codex_collector,))
+            self.assertEqual({v["id"] for v in col.poll(self.now)}, {"claude-id", "codex:same-id"})
+            self.assertEqual(col.next_scan, self.now + collector.RESCAN)
+            with claude.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"timestamp": self.event("x")["timestamp"], "type": "assistant", "message": {
+                    "content": [{"type": "text", "text": "Claude still updates"}], "stop_reason": "end_turn"}}) + "\n")
+            views = {v["id"]: v for v in col.poll(self.now + 1)}
+            self.assertEqual(views["claude-id"]["last_text"], "Claude still updates")
+            history = collector.History(self.reg, sources=(codex_collector,))
+            self.assertEqual({v["id"] for v in history.recent(set(), self.now)}, {"claude-id", "codex:same-id"})
+            log.assert_called()
+            repaired = dict(self.meta, payload=dict(self.meta["payload"], id="bad"))
+            bad.write_text(json.dumps(repaired) + "\n" + json.dumps(self.event("task_started")) + "\n", encoding="utf-8")
+            self.assertIn("codex:bad", {v["id"] for v in col.poll(self.now + collector.RESCAN + 1)})
+
+    def test_partial_header_does_not_stop_claude_and_recovers(self):
+        self.check_bad_header_isolated('{"type":"session_meta","payl')
+
+    def test_missing_session_id_does_not_stop_claude_and_recovers(self):
+        self.check_bad_header_isolated('{"type":"session_meta","payload":{}}\n')
+
+    def test_non_object_payload_item_and_plan_are_ignored(self):
+        self.write_parent()
+        self.claude_record()
+        malformed = [dict(self.event("x"), payload=[1]), dict(self.event("x"), payload="wrong"),
+                     self.event("item_completed", item=[1]), self.event("item_completed", item="wrong"),
+                     self.response("function_call", name="update_plan", arguments=json.dumps({"plan": [None, "wrong"]})),
+                     self.event("task_complete")]
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write("".join(json.dumps(e) + "\n" for e in malformed))
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")):
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
+            self.assertEqual({v["id"]: v["state"] for v in views}, {"claude-id": "done", "codex:same-id": "done"})
+
+    def test_pump_failure_isolated_and_retried_at_next_scan(self):
+        self.write_parent()
+        self.claude_record()
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), patch.object(collector, "log"):
+            col = collector.Collector(self.reg, sources=(codex_collector,))
+            col.poll(self.now)
+            with patch.object(col.sessions[str(self.path)], "pump", side_effect=RuntimeError("broken record")):
+                self.assertEqual([v["id"] for v in col.poll(self.now + 1)], ["claude-id"])
+            self.assertIn("codex:same-id", {v["id"] for v in col.poll(self.now + collector.RESCAN + 1)})
+
+    def test_history_parser_failure_isolated_and_recovers(self):
+        self.write_parent(finished=True)
+        self.claude_record()
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), patch.object(collector, "log"):
+            history = collector.History(self.reg, sources=(codex_collector,))
+            with patch.object(codex_collector.CodexSession, "view", side_effect=AttributeError("broken record")):
+                self.assertEqual([v["id"] for v in history.recent(set(), self.now)], ["claude-id"])
+            self.assertEqual({v["id"] for v in history.recent(set(), self.now + history.EVERY + 1)},
+                             {"claude-id", "codex:same-id"})
+
+    def test_unreadable_old_parent_does_not_stop_child_or_claude(self):
+        self.write_parent()
+        self.claude_record()
+        self.add_child(parent="bad")
+        bad = self.path.with_name("rollout-bad.jsonl")
+        bad.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
+        os.utime(bad, (self.now - 4000, self.now - 4000))
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), patch.object(collector, "log"):
+            views = collector.Collector(self.reg, sources=(codex_collector,)).poll(self.now)
+        self.assertEqual({v["id"] for v in views}, {"claude-id", "codex:same-id", "codex:child"})
+
+    def test_parent_cycles_return_without_hiding_records(self):
+        base = self.session.view(self.now)
+        cases = [[dict(base, id="codex:a", parent_id="codex:b"), dict(base, id="codex:b", parent_id="codex:a")],
+                 [dict(base, id="codex:a", parent_id="codex:a")]]
+        code = ("import json, sys, codex_collector; "
+                "print(json.dumps([codex_collector.group_views(v) for v in json.load(sys.stdin)]))")
+        proc = subprocess.run([sys.executable, "-c", code], input=json.dumps(cases), text=True,
+                              capture_output=True, timeout=5, env=dict(os.environ, PYTHONPATH=str(APP)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([{v["id"] for v in vs} for vs in json.loads(proc.stdout)],
+                         [{"codex:a", "codex:b"}, {"codex:a"}])
+
+    def test_started_at_seconds_milliseconds_iso_and_unknown(self):
+        iso = datetime.fromtimestamp(self.now, timezone.utc).isoformat()
+        for value in (self.now, self.now * 1000, iso, None, "unknown", [], True):
+            with self.subTest(value=value):
+                v = self.feed(self.event("task_started", started_at=value), self.event("task_complete", started_at=value))
+                self.assertAlmostEqual(v["start"], self.now, delta=1e-5)
+                self.assertAlmostEqual(v["end"] - v["start"], 0, delta=1e-5)
+
+    def test_old_rollout_tail_cache_invalidates_on_append(self):
+        self.write_parent()
+        codex_collector.CodexSession.latest_stamp.cache_clear()
+        original = codex_collector.Tail.lines
+        with patch.object(codex_collector.Tail, "lines", autospec=True, side_effect=original) as lines:
+            active = codex_collector.CodexSession.recently_active
+            self.assertTrue(active(str(self.path), self.now - 1))
+            self.assertFalse(active(str(self.path), self.now + 1))
+            self.assertEqual(lines.call_count, 1)
+            self.now += 2
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(self.event("agent_message", message="new line")) + "\n")
+            self.assertTrue(active(str(self.path), self.now - 1))
+            self.assertEqual(lines.call_count, 2)
+
+    def test_unrecognized_read_state_shapes_stay_unread(self):
+        view = self.native_view()
+        identity = view["read_identity"]
+        documents = [[], None, {"electron-thread-read-state-v1": []},
+                     {"electron-thread-read-state-v1": {"version": 1, "unreadByIdentity": []}},
+                     {"electron-thread-read-state-v1": {"version": 1, "unreadByIdentity": {identity: []}}}]
+        path = self.base / ".codex-global-state.json"
+        reads = codex_collector.ReadState()
+        for i, document in enumerate(documents):
+            with self.subTest(document=document):
+                path.write_text(json.dumps(document), encoding="utf-8")
+                os.utime(path, (self.now + i + 1, self.now + i + 1))
+                self.assertFalse(reads.is_read(view))
+
+    def run_worker_once(self, hud):
+        from types import SimpleNamespace
+        hud.reg = self.reg
+        hud.cfg.update(history_days=3, pinned={}, assigned={}, live_only=False)
+        hud.runner = SimpleNamespace(tick=lambda: None, owned=lambda: {}, active=lambda: {}, exited={}, starting=lambda ids: [])
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), \
+                patch.object(hud.test_module.time, "sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                hud.worker()
+
+    def test_claude_history_has_no_gap_between_ten_and_thirty_minutes(self):
+        self.claude_record(finished=self.now - collector.DONE_KEEP - 60)
+        hud = self.make_hud()
+        self.run_worker_once(hud)
+        self.assertEqual(hud.views, [])
+        self.assertEqual([v["id"] for v in hud.history], ["claude-id"])
+        hud.unread.append(dict(hud.history[0], key="old"))
+        self.assertEqual([v["id"] for v in hud.ended_items()], ["claude-id"])
+
+    def test_disable_codex_does_not_scan_read_or_flash(self):
+        self.write_parent(finished=True)
+        self.claude_record()
+        hud = self.make_hud()
+        hud.cfg["codex_on"] = False
+        with patch.object(codex_collector, "session_files") as scan:
+            self.run_worker_once(hud)
+            scan.assert_not_called()
+        self.assertEqual([v["id"] for v in hud.views], ["claude-id"])
+        view = self.native_view()
+        hud.unread.append(dict(view, key="hidden"))
+        with patch.object(hud.codex_reads, "is_read") as read, patch.object(hud, "start_flash") as flash:
+            hud.on_event("finished", view, True)
+            hud.sync()
+            read.assert_not_called()
+            flash.assert_not_called()
+        self.assertEqual(hud.ended_items()[0]["id"], "claude-id")
+        self.assertEqual([u["key"] for u in hud.unread if collector.is_codex(u)], ["hidden"])
+
+    def fixture_session(self, name):
+        fixture = Path(__file__).resolve().parent / "fixtures/codex" / (name + ".jsonl")
+        path = self.base / (name + ".jsonl")
+        path.write_bytes(fixture.read_bytes())
+        return codex_collector.CodexSession(str(path), self.reg)
+
+    def test_redacted_real_desktop_and_child_records(self):
+        parent, child = self.fixture_session("desktop"), self.fixture_session("child")
+        parent.pump()
+        child.pump()
+        grouped = codex_collector.group_views([parent.view(self.now), child.view(self.now)])
+        self.assertEqual([v["id"] for v in grouped], ["codex:fixture-parent"])
+        self.assertEqual(grouped[0]["start"], 1760000000)
+        self.assertEqual(grouped[0]["end"] - grouped[0]["start"], 118)
+        self.assertEqual([(s["id"], s["state"]) for s in grouped[0]["subs"]], [("codex:fixture-child", "done")])
+
+    def test_redacted_real_question_lifecycle(self):
+        session = self.fixture_session("question")
+        with open(session.path, encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream][1:]
+        states = []
+        for event in events:
+            session.feed(event)
+            states.append(session.view(collector.stamp_of(event))["state"])
+        self.assertEqual(states, ["run", "ask", "run", "done"])
+
+    def test_codex_toggle_preserves_claude_completion_notification(self):
+        from types import SimpleNamespace
+        path = self.claude_record()
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        path.write_text(lines[0], encoding="utf-8")
+        hud = self.make_hud()
+        hud.reg = self.reg
+        hud.cfg.update(history_days=3, pinned={}, assigned={})
+        hud.runner = SimpleNamespace(tick=lambda: None, owned=lambda: {}, active=lambda: {}, exited={}, starting=lambda ids: [])
+        sleeps = []
+
+        def toggle(_):
+            if sleeps:
+                raise StopIteration
+            sleeps.append(True)
+            hud.cfg["codex_on"] = False
+            path.write_text("".join(lines), encoding="utf-8")
+
+        with patch.object(collector, "PROJECTS", str(self.base / "claude")), \
+                patch.object(hud.test_module.hub, "SETTLE", 0), patch.object(hud.test_module.time, "sleep", side_effect=toggle):
+            with self.assertRaises(StopIteration):
+                hud.worker()
+        events = list(hud.events.queue)
+        self.assertEqual([(kind, view["id"], notify) for kind, view, notify in events], [("finished", "claude-id", True)])
 
 
 if __name__ == "__main__":

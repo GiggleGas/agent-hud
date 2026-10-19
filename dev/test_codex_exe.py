@@ -42,8 +42,7 @@ def run_profile(label, finished=False, custom_home=False, desktop_sync=False):
     (sessions / ("rollout-" + child_sid + ".jsonl")).write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in child_events), encoding="utf-8")
     settings = profile / ".claude/agent-hud"
     settings.mkdir(parents=True, exist_ok=True)
-    (settings / "config.json").write_text(json.dumps({"unread": [
-        {"id": "codex:" + child_sid, "title": "[Codex 子任务] /root/review"}], "rule_asked": True}, ensure_ascii=False), encoding="utf-8")
+    (settings / "config.json").write_text(json.dumps({"rule_asked": True, "unread": []}), encoding="utf-8")
     (codex / "session_index.jsonl").write_text(json.dumps({"id": sid, "thread_name": label + "本机对话"}, ensure_ascii=False) + "\n", encoding="utf-8")
     expected = {"codex:" + sid}
     if not finished:
@@ -82,10 +81,12 @@ def run_profile(label, finished=False, custom_home=False, desktop_sync=False):
                     pass
                 time.sleep(0.1)
             raise AssertionError(("badge did not change", label, expected))
-        wait_badge(True)
-        native_state([])
-        wait_badge(False)
-        proc.wait(timeout=12)
+        try:
+            wait_badge(True)
+            native_state([])
+            wait_badge(False)
+        finally:
+            proc.wait(timeout=12)
         assert json.loads(read_path.read_text(encoding="utf-8"))["electron-thread-read-state-v1"]["unreadByIdentity"][identity][host] == []
     else:
         proc = subprocess.run([str(EXE), "--no", "--exit-after", "5"], env=env,
@@ -102,7 +103,7 @@ def run_profile(label, finished=False, custom_home=False, desktop_sync=False):
     if log.exists():
         assert "Traceback" not in log.read_text(encoding="utf-8")
     RESULTS.append({"profile": label, "custom_codex_home": custom_home, "visible_session_ids": sorted(observed),
-                    "child_not_counted_separately": True, "old_child_snapshot_removed": True,
+                    "child_not_counted_separately": True,
                     "desktop_read_changed_while_running": desktop_sync,
                     "settings_saved_in_target_profile": True, "no_python_on_path": True, "exit_code": proc.returncode})
 

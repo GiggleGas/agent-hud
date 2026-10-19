@@ -2,8 +2,10 @@
 import glob
 import hashlib
 import json
+import math
 import os
 import time
+from functools import lru_cache
 
 import install
 from collector import INIT_CHUNK, LIVE, Session, Tail, first_line, last_line_with, stamp_of
@@ -15,6 +17,14 @@ def codex_home():
 
 def identity_key(account, user):
     return hashlib.sha256(json.dumps(["chatgpt", account, user], separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def started_stamp(value, fallback):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+        return value / 1000 if value >= 1e12 else value
+    if isinstance(value, str):
+        return stamp_of({"timestamp": value}) or fallback
+    return fallback
 
 
 class ReadState:
@@ -35,8 +45,10 @@ class ReadState:
             version = (path, stat.st_mtime_ns, stat.st_size)
             if version != self.version:
                 with open(path, encoding="utf-8") as stream:
-                    state = json.load(stream).get("electron-thread-read-state-v1", {})
-                self.identities = state.get("unreadByIdentity", {}) if state.get("version") == 1 else {}
+                    document = json.load(stream)
+                state = document.get("electron-thread-read-state-v1") if isinstance(document, dict) else None
+                identities = state.get("unreadByIdentity") if isinstance(state, dict) and state.get("version") == 1 else None
+                self.identities = identities if isinstance(identities, dict) else {}
                 self.version, self.modified = version, stat.st_mtime
         except (OSError, ValueError):
             return False
@@ -44,12 +56,12 @@ class ReadState:
         if self.modified < view["end"]:
             return False
         hosts = self.identities.get(view["read_identity"], {})
-        unread = hosts.get(self.LOCAL_HOST)
+        unread = hosts.get(self.LOCAL_HOST) if isinstance(hosts, dict) else None
         return isinstance(unread, list) and view["id"][6:] not in unread
 
 
 def session_files():
-    return glob.glob(os.path.join(codex_home(), "sessions", "*", "*", "*", "*.jsonl"))
+    return [(p, CodexSession) for p in glob.glob(os.path.join(codex_home(), "sessions", "*", "*", "*", "*.jsonl"))]
 
 
 _title_cache = {}
@@ -71,14 +83,18 @@ def session_title(sid):
                     item = json.loads(line)
                 except ValueError:
                     continue  # The writer may not have finished the last line yet.
-                titles[item["id"]] = item.get("thread_name") or ""
+                if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("thread_name"), str):
+                    titles[item["id"]] = item["thread_name"]
         _title_cache, _title_version = titles, version
     return _title_cache.get(sid, "")
 
 
 def text_content(content):
+    if not isinstance(content, list):
+        return ""
     return "\n".join(b.get("text", "") for b in content or []
-                     if isinstance(b, dict) and b.get("type", "").lower() in ("text", "input_text", "output_text"))
+                     if isinstance(b, dict) and b.get("type") in ("text", "Text", "input_text", "output_text")
+                     and isinstance(b.get("text", ""), str))
 
 
 def group_views(views):
@@ -89,8 +105,14 @@ def group_views(views):
         parent = items.get(v.get("parent_id"))
         if parent is None:
             continue
+        walked = {v["id"]}
         while parent.get("parent_id") in items:
+            if parent["id"] in walked:
+                break
+            walked.add(parent["id"])
             parent = items[parent["parent_id"]]
+        if parent["id"] in walked:
+            continue  # Keep cyclic records visible independently instead of hiding every node.
         children.add(v["id"])
         if v["state"] not in LIVE and v["start"] < parent["start"] - 5:
             continue
@@ -110,24 +132,34 @@ class CodexSession(Session):
     @staticmethod
     def recently_active(path, cutoff):
         # Windows can retain an old mtime while the rollout writer holds its file open.
-        size = os.path.getsize(path)
+        stat = os.stat(path)
+        stamp = CodexSession.latest_stamp(path, stat.st_mtime_ns, stat.st_size)
+        return stamp is not None and stamp >= cutoff
+
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def latest_stamp(path, modified, size):
+        # Cache timestamps, not the cutoff decision, so unchanged records can age out.
         for chunk in (64 << 10, INIT_CHUNK):
             pos = max(0, size - chunk)
             for raw in reversed(Tail(path, pos, pos > 0).lines()):
                 try:
-                    stamp = stamp_of(json.loads(raw))
+                    item = json.loads(raw)
+                    stamp = stamp_of(item) if isinstance(item, dict) else None
                 except ValueError:
                     continue
                 if stamp:
-                    return stamp >= cutoff
+                    return stamp
             if pos == 0:
                 break
-        return False
+        return None
 
     def __init__(self, path, reg, tail=None):
         super().__init__(path, reg, tail=tail or INIT_CHUNK)
         with open(path, "rb") as stream:
             meta = json.loads(stream.readline())["payload"]
+        if not isinstance(meta, dict) or not isinstance(meta.get("id") or meta.get("session_id"), str):
+            raise ValueError("session_meta must contain a string id")
         self.sid = "codex:" + (meta.get("id") or meta["session_id"])
         self.cwd = self.root = meta.get("cwd") or ""
         self.desktop = meta.get("originator") == "Codex Desktop"
@@ -137,8 +169,11 @@ class CodexSession(Session):
         source = meta.get("source")
         self.child = meta.get("thread_source") == "subagent" or (isinstance(source, dict) and "subagent" in source)
         self.agent_path = meta.get("agent_path") or ""
-        spawn = source.get("subagent", {}).get("thread_spawn", {}) if isinstance(source, dict) else {}
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        spawn = spawn if isinstance(spawn, dict) else {}
         self.parent_sid = "codex:" + spawn["parent_thread_id"] if spawn.get("parent_thread_id") else None
+        self.parent_file_id = spawn.get("parent_thread_id")
         self.agent_name = (self.agent_path or spawn.get("agent_path") or "").rsplit("/", 1)[-1]
         if tail is None:
             pos = last_line_with(path, b'"task_started"')
@@ -182,6 +217,7 @@ class CodexSession(Session):
             self.on_tool("PowerShell", {"command": args.get("cmd") or args.get("command") or ""})
         elif short == "update_plan":
             plan = args.get("plan") or []
+            plan = [p for p in plan if isinstance(p, dict)] if isinstance(plan, list) else []
             done = sum(p.get("status") == "completed" for p in plan)
             current = next((p.get("step", "") for p in plan if p.get("status") == "in_progress"), "")
             if plan:
@@ -193,7 +229,9 @@ class CodexSession(Session):
         stamp = stamp_of(e)
         if stamp:
             self.last_ts = max(self.last_ts, stamp)
-        p = e.get("payload") or {}
+        p = e.get("payload")
+        if not isinstance(p, dict):
+            return
         kind = p.get("type")
         if e.get("type") == "turn_context":
             if p.get("cwd"):
@@ -201,7 +239,7 @@ class CodexSession(Session):
             return
         if e.get("type") == "event_msg":
             if kind in ("task_started", "turn_started"):
-                self.begin(p.get("started_at") or stamp)
+                self.begin(started_stamp(p.get("started_at"), stamp))
             elif kind == "user_message":
                 if not self.active:
                     self.begin(stamp)
@@ -211,7 +249,7 @@ class CodexSession(Session):
                 if kind == "agent_message":
                     self.on_text(p.get("message") or "")
             elif kind in ("task_complete", "turn_complete"):
-                self.job_ts = p.get("started_at") or self.job_ts
+                self.job_ts = started_stamp(p.get("started_at"), self.job_ts or stamp)
                 if p.get("last_agent_message"):
                     self.on_text(p["last_agent_message"])
                 self.finish(stamp, "done")
@@ -222,6 +260,8 @@ class CodexSession(Session):
                 self.finish(stamp, "error")
             elif kind == "item_completed":
                 item = p.get("item") or {}
+                if not isinstance(item, dict):
+                    return
                 if item.get("type") == "UserMessage":
                     self.user_text(text_content(item.get("content")))
                 elif item.get("type") == "AgentMessage":

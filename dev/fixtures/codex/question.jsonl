@@ -1,0 +1,5 @@
+{"type": "session_meta", "payload": {"id": "fixture-parent", "cwd": "C:/Fixture/Project", "originator": "Codex Desktop", "source": "vscode", "creator_account_id": "fixture-account", "creator_user_id": "fixture-user", "thread_source": "subagent"}}
+{"timestamp": "2025-10-09T08:53:20+00:00", "type": "event_msg", "payload": {"type": "task_started", "started_at": 1760000000}}
+{"timestamp": "2025-10-09T08:53:39+00:00", "type": "response_item", "payload": {"type": "function_call", "name": "request_user_input", "call_id": "fixture-question", "arguments": "{\"questions\": [{\"id\": \"fixture-choice\", \"header\": \"Choice\", \"question\": \"Choose a fixture\", \"options\": [{\"label\": \"A\", \"description\": \"Fixture A\"}, {\"label\": \"B\", \"description\": \"Fixture B\"}]}]}"}}
+{"timestamp": "2025-10-09T08:53:42+00:00", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "fixture-question", "output": "Fixture answer"}}
+{"timestamp": "2025-10-09T08:54:31+00:00", "type": "event_msg", "payload": {"type": "task_complete", "started_at": 1760000000, "last_agent_message": "Fixture result"}}

@@ -103,15 +103,21 @@ class Web:
     def state(self):
         hud, now = self.hud, time.time()
         unread = {u["id"] for u in hud.unread}
-        live = sorted([v for v in hud.views if v["state"] in LIVE], key=lambda v: v["start"])
-        recent = sorted([v for v in hud.ended_items() if now - hud.when(v) <= 86400], key=lambda v: -hud.when(v))
+        live = sorted([v for v in hud.views if v["state"] in LIVE and not collector.is_codex(v)], key=lambda v: v["start"])
+        recent = sorted([v for v in hud.ended_items() if now - hud.when(v) <= 86400 and not collector.is_codex(v)], key=lambda v: -hud.when(v))
+        projects = []
+        for g in hud.groups():
+            items = [v for v in g["items"] if not collector.is_codex(v)]
+            if items:
+                projects.append({"name": g["name"], "color": g["color"],
+                                 "live": sum(v["state"] in LIVE for v in items),
+                                 "new": sum(v["id"] in unread for v in items if v["state"] not in LIVE),
+                                 "items": [self.item(v, unread) for v in items[:30]]})
         return {
             "now": now,
             "live": [self.item(v, unread) for v in live],
             "recent": [self.item(v, unread) for v in recent],
-            "projects": [{"name": g["name"], "color": g["color"], "live": len(g["live"]),
-                          "new": sum(1 for v in g["done"] if v["id"] in unread),
-                          "items": [self.item(v, unread) for v in g["items"][:30]]} for g in hud.groups()],
+            "projects": projects,
             "workspaces": [it["name"] for it in hud.reg.items],
             "usage": usage.line(hud.usage),   # Claude 的用量，一句话；查不到是空的
         }
@@ -120,7 +126,7 @@ class Web:
         v = self.hud.find(sid)
         if not v:
             return None
-        if sid.startswith("codex:"):
+        if collector.is_codex(v):
             return None
         self.hud.events.put(("read", {"id": sid}, False))   # 在手机上看过了，就算已读
         out = self.item(v, set())
@@ -152,7 +158,7 @@ class Web:
 
     def reply(self, sid, text, tool_id=None):
         """回复一句话；tool_id 不为空表示这是在回答那道选择题。"""
-        if sid.startswith("codex:"):
+        if collector.is_codex(self.hud.find(sid) or {"id": sid}):
             raise ValueError("Codex 目前仅支持在悬浮窗中查看状态，请在 Codex 中回复。")
         job = uuid.uuid4().hex[:8]
         self.jobs[job] = {"state": "sending", "message": "正在发送…"}

@@ -1,0 +1,2 @@
+{"type": "session_meta", "payload": {"id": "fixture-child", "cwd": "C:/Fixture/Project", "originator": "Codex Desktop", "source": {"subagent": {"thread_spawn": {"parent_thread_id": "fixture-parent"}}}, "creator_account_id": "fixture-account", "creator_user_id": "fixture-user", "thread_source": "subagent", "agent_path": "/root/fixture-child"}}
+{"timestamp": "2025-10-09T08:53:25+00:00", "type": "event_msg", "payload": {"type": "task_complete", "started_at": 1760000000, "last_agent_message": "Fixture result"}}
