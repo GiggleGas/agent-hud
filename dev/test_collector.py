@@ -226,7 +226,7 @@ check("悬浮窗启动时已经结束的：列出来，但不对外通知", kind
 h = hub.Hub()
 h.update(one("run"), 100)
 check("刚结束先不报", h.update(one("done"), 101), [])
-check("稳住 3 秒后报，要通知", kinds(h.update(one("done"), 104.5)), [("finished", True)])
+check("稳住 SETTLE 秒后报，要通知", kinds(h.update(one("done"), 101 + hub.SETTLE)), [("finished", True)])
 check("不重复报", h.update(one("done"), 110), [])
 h.update(one("run"), 111)
 h.update(one("done"), 112)
@@ -302,6 +302,24 @@ check("对话记录没动、但后台还在往输出里写：照样在等", bcol
 w(bmain, [notified(time.time(), "bx3", "killed")])
 bcol.sessions[bmain].pump()
 check("被停掉也算等完了", [b["desc"] for b in bcol.sessions[bmain].view(time.time())["bg"] if not b["resident"]], [])
+
+print("== 排队的消息：它忙的时候你又发了一句")
+qmain = os.path.join(bproj, "squeue.jsonl")
+Q0 = time.time() - 30
+queue = lambda t, op, **kw: dict({"type": "queue-operation", "operation": op, "timestamp": iso(t), "sessionId": "squeue"}, **kw)
+w(qmain, [user(Q0, "改一下标题"), asst(Q0 + 1, [tool("q1", "Edit", file_path="a.py")]), queue(Q0 + 2, "enqueue"),
+          result(Q0 + 3, "q1"), asst(Q0 + 4, [{"type": "text", "text": "改好了。"}], "end_turn")])
+bcol.next_scan = 0
+qv = lambda t: next(x for x in bcol.poll(t) if x["id"] == "squeue")
+check("这一轮完了、你排队的话还没交给它 -> 还算在跑，不报完成", (qv(Q0 + 5)["state"], qv(Q0 + 5)["action"]), ("run", "接着处理你排队的消息"))
+check("排着的消息一直没出队（比如对话被关了）：过一会儿就不等了", qv(Q0 + 4 + collector.QUEUE_WAIT + 1)["state"], "done")
+w(qmain, [queue(Q0 + 6, "dequeue"), user(Q0 + 6, "顺便把副标题也改了"), asst(Q0 + 8, [{"type": "text", "text": "都改好了。"}], "end_turn")])
+check("出队、接着做完 -> 完成", qv(Q0 + 9)["state"], "done")
+w(qmain, [user(Q0 + 10, "再看看别的"), asst(Q0 + 11, [tool("q2", "Read", file_path="b.py")]), queue(Q0 + 12, "enqueue"),
+          {"type": "attachment", "timestamp": iso(Q0 + 12), "attachment": {"type": "queued_command", "prompt": "顺手看看 c.py"}},
+          queue(Q0 + 13, "remove", reason="absorbed_mid_turn"), result(Q0 + 14, "q2"),
+          asst(Q0 + 15, [{"type": "text", "text": "都看了。"}], "end_turn")])
+check("中途就被读掉的（移除了）：不算还排着，照常完成", qv(Q0 + 16)["state"], "done")
 
 print("== 后台命令：悬浮窗中途打开（靠压缩后的 task_status 补上）")
 cmain = os.path.join(bproj, "scomp.jsonl")

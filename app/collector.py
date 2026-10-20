@@ -20,6 +20,7 @@ DONE_KEEP = 10 * 60      # 回合结束后还在窗口里留多久
 STALE = 10 * 60          # 回合没结束、也没有工具在跑，这么久没动静就算断了
 STALE_TOOL = 30 * 60     # 有工具在跑时放宽（长命令、前台子 agent）
 CONFIRM_AFTER = 20       # 本该瞬间完成的工具卡了这么久，多半是在等用户点确认
+QUEUE_WAIT = 10          # 一轮结束时还有排队的消息：这么久内当它在接着做；过了还没出队（比如对话被关了）就不等了
 RESCAN = 5               # 多久重新找一遍新会话 / 新子 agent
 INIT_CHUNK = 8 << 20
 INIT_MAX = 128 << 20
@@ -345,6 +346,7 @@ class Session(Track):
         self.job_ts = None    # 最近一次用户发话的时间
         self.signals = {}     # 子 agent id -> (结果, 时间)
         self.subs = {}
+        self.queued = 0       # 排着队的消息条数（进队 - 出队 / 移除）：一轮结束时还有，说明它马上接着做
         self.launching = {}   # 刚发出去的后台命令：tool_use_id -> (说明, 命令)，等工具结果给出任务编号
         self.bg = {}          # 还在跑的后台命令：任务编号 -> {desc, start, out 输出文件, resident 常驻的}；跨回合，收到结束通知才划掉
 
@@ -420,6 +422,8 @@ class Session(Track):
             self.on_user(e, msg.get("content"), stamp)
         elif kind == "attachment" and isinstance(e.get("attachment"), dict):
             self.on_task_status(e["attachment"], stamp)
+        elif kind == "queue-operation":   # 用户发的每句话都先进队；它忙的时候发的，要等这一轮完了才出队（或者中途被读掉、移除）
+            self.queued = self.queued + 1 if e.get("operation") == "enqueue" else max(0, self.queued - 1)
 
     def add_bg(self, tid, desc, command, out, stamp):
         self.bg[tid] = {"desc": desc or tid, "start": stamp or self.last_ts, "out": out or "",
@@ -522,6 +526,8 @@ class Session(Track):
                 state, action = "confirm", "可能在等你点确认 · " + calls[0][1]
             else:
                 state, action = "run", self.doing()
+        elif self.queued and now - (self.end_ts or 0) < QUEUE_WAIT:   # 这一轮完了，但你排队的话还没交给它：马上接着做，不算完成
+            state, action = "run", "接着处理你排队的消息"
         elif waiting and quiet > STALE_TOOL:   # 对话被关掉时后台命令跟着没了，不会有结束通知
             state, action = "stale", "后台可能已经停了，%d 分钟没动静" % (quiet // 60)
         elif waiting or running:   # 这一轮说完了，但后台还有活：等它们结束会自己接着干，不算完成

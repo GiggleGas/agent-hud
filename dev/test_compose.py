@@ -241,14 +241,59 @@ check("连着换了两次再撤掉：回到最早自动判断的 agent-hud，不
 print("== 右键「不用等后台了」")
 bgv = next(x for x in mod.demo_views(time.time()) if x["state"] == "bg" and x["bg"])
 flashes = []
-h.start_flash = lambda: flashes.append(1)
+h.start_flash = lambda sid=None: flashes.append(1)
 h.stop_waiting(bgv["id"], bgv)
-check("记下在等的后台命令；开着的服务器本来就不等，不用记", h.cfg["bg_ignored"], [b["id"] for b in bgv["bg"] if not b["resident"]])
+check("记下在等的后台命令；开着的服务器本来就不等，不用记", h.cfg["bg_ignored"] == [b["id"] for b in bgv["bg"] if not b["resident"]], h.cfg["bg_ignored"])
 before = len(h.unread)
 h.on_event("finished", dict(bgv, state="done", last_text=""), True)
-check("随后那次结束：不闪光、不进「已结束」（用户自己说的不用等）", (flashes, len(h.unread)), ([], before))
+check("随后那次结束：不闪光、不进「已结束」（用户自己说的不用等）", (flashes, len(h.unread)) == ([], before), (flashes, len(h.unread)))
 h.on_event("finished", dict(bgv, state="done", last_text="", end=bgv["end"] + 60), True)
-check("以后真的又做完了：照常闪光、进「已结束」", (flashes, len(h.unread)), ([1], before + 1))
+check("以后真的又做完了：照常闪光、进「已结束」", (flashes, len(h.unread)) == ([1], before + 1), (flashes, len(h.unread)))
+
+print("== 正看着这个对话时不提醒")
+tabs = [runner.tab_of("Agent进度悬浮窗 - Something - Cursor", "cursor"), runner.tab_of("a - b - Something - Cursor", "cursor"),
+       runner.tab_of("● main.py - shop - Visual Studio Code", "vscode"), runner.tab_of("Something - Cursor", "cursor"),
+       runner.tab_of("Agent进度悬浮窗 - Something - Cursor", "vscode")]
+check("窗口标题拆成（当前标签, 文件夹）：标签里带「 - 」也行、没保存的「●」去掉、只有两段的分不清",
+      tabs == [("Agent进度悬浮窗", "Something"), ("a - b", "Something"), ("main.py", "shop"), None, None], tabs)
+h.demo = False
+base = dict(bgv, state="done", last_text="", owned=False, bg=[], subs=[])
+mine = dict(base, id="f-1", title="调第 7 关数值", root=os.path.join(root, "agent-hud"))
+twin = dict(base, id="f-2", title="调第 7 关数值", root=os.path.join(root, "shop"))
+other = dict(base, id="f-3", title="整理部署脚本", root=os.path.join(root, "shop"))
+h.views, h.history = [mine, other], [twin]
+real_tab = runner.focused_tab
+runner.focused_tab = lambda: ("整理部署脚本", "shop")
+got = h.focused_session()
+check("最前面的编辑器当前标签就是这个对话的标题 -> 认出正看着它", got == "f-3", got)
+runner.focused_tab = lambda: ("调第 7 关数值", "agent-hud")
+got = h.focused_session()
+check("几个对话同名：按窗口开的文件夹分", got == "f-1", got)
+runner.focused_tab = lambda: ("调第 7 关数值", "别的文件夹")
+got = h.focused_session()
+check("还分不出来：当看不出来", got == None, got)
+runner.focused_tab = lambda: None
+got = h.focused_session()
+check("最前面不是编辑器：看不出来", got == None, got)
+
+flashes.clear()
+runner.focused_tab = lambda: ("整理部署脚本", "shop")
+h.sync()
+before = len(h.unread)
+h.on_event("finished", other, True)
+check("结束时正看着它：不闪光、不进「已结束」，但记成看过了（重启后也不会冒出来）",
+      (flashes, len(h.unread), "f-3@%d" % other["end"] in h.cfg["seen"]) == ([], before, True), (flashes, len(h.unread)))
+runner.focused_tab = lambda: None
+h.sync()
+h.on_event("finished", dict(mine, end=mine["end"] + 1), True)
+check("没在看它：照常闪光、进「已结束」", (flashes, any(u["id"] == "f-1" for u in h.unread)) == ([1], True), flashes)
+h.flash_since, h.flash_for = time.time(), {"f-1"}
+runner.focused_tab = lambda: ("调第 7 关数值", "agent-hud")
+h.sync()
+check("切到这个对话：算看过了，为它闪的光也停了",
+      (any(u["id"] == "f-1" for u in h.unread), h.flash_since) == (False, None), h.flash_since)
+runner.focused_tab = real_tab
+h.demo = True
 h.root.destroy()
 print("\n失败 %d 项：%s" % (len(fails), fails) if fails else "\n全部通过")
 sys.exit(1 if fails else 0)

@@ -125,6 +125,41 @@ def editor_windows():
     return found
 
 
+def tab_of(title, scheme):
+    """编辑器窗口标题「当前标签 - 文件夹名 - 编辑器名」拆成 (当前标签, 文件夹名)。Claude 对话的标签名就是对话标题。
+    标签名里可以有「 - 」，所以从右边拆；只有两段（没开文件夹 / 没开标签）分不清是哪个，返回 None。"""
+    end = " - " + TITLE_ENDS[scheme]
+    if not title.endswith(end):
+        return None
+    parts = title[:-len(end)].lstrip("● ").rsplit(" - ", 1)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else None
+
+
+def focused_tab():
+    """最前面的窗口如果是编辑器，返回它的 (当前标签, 文件夹名)；不是编辑器（或者看不出来）返回 None。
+    只看最前面这一个窗口，悬浮窗每 0.5 秒问一次也不费事。"""
+    u, k = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32")
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    k.OpenProcess.restype = wintypes.HANDLE
+    hwnd = u.GetForegroundWindow()
+    title = ctypes.create_unicode_buffer(400)
+    if not hwnd or not u.GetWindowTextW(ctypes.c_void_p(hwnd), title, 400):
+        return None
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    h = k.OpenProcess(0x1000, False, pid.value)
+    if not h:
+        return None
+    try:
+        buf, n = ctypes.create_unicode_buffer(520), wintypes.DWORD(520)
+        if not k.QueryFullProcessImageNameW(wintypes.HANDLE(h), 0, buf, ctypes.byref(n)):
+            return None
+        scheme = EDITORS.get(os.path.basename(buf.value).lower())
+    finally:
+        k.CloseHandle(wintypes.HANDLE(h))
+    return tab_of(title.value, scheme) if scheme else None
+
+
 def claude_processes():
     """正在跑的 claude 程序的命令行。"""
     try:   # wmic 快；新版 Windows 去掉了它，就退回 PowerShell

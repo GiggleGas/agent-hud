@@ -4,7 +4,8 @@ import time
 from collector import LIVE
 
 ENDED = ("done", "error", "interrupted")
-SETTLE = 3   # 结束状态稳住这么多秒才算数：排队的消息、后台任务回来会让它「刚结束马上又开工」，那种不报
+SETTLE = 1   # 结束状态稳住这么多秒才算数，防「刚结束马上又开工」。排队的消息、后台任务现在采集时就认得出来（还算在跑 / 等后台），
+             # 这里只兜底认不出来的（比如别的对话发来的消息），所以不用等太久
 
 
 class Hub:

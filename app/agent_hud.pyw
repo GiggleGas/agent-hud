@@ -44,7 +44,7 @@ import web  # noqa: E402
 import workspaces  # noqa: E402
 from collector import LIVE  # noqa: E402
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 NAME = "Agent 悬浮窗"
 CONFIG = os.path.join(install.TARGET, "config.json")   # 脚本版和 exe 版共用同一份设置
 LOG = os.path.join(install.TARGET, "hud.log")
@@ -274,6 +274,8 @@ class Hud:
         self.hidden = False             # 藏在托盘里了
         self.close_ask = None           # 点 ✕ 时问「收到托盘还是退出」的那个窗口
         self.flash_since = None         # 任务完成的闪光是从什么时候开始的；不在闪是 None
+        self.flash_for = set()          # 为哪些对话闪的：用户在编辑器里把它们都看过了，闪光自己停
+        self.focus_sid = None           # 用户此刻正看着的对话（最前面的编辑器窗口当前标签就是它）；看不出来是 None
         self.glow = self.glow_c = self.glow_hwnd = None   # 画闪光的那层透明窗口（第一次闪的时候才建）
         self.usage = demo_usage(time.time()) if self.demo else None   # Claude 的用量（usage.fetch 的结果），后台线程更新
         self.usage_wake = threading.Event()   # 点用量那一行：叫后台线程马上再查
@@ -462,7 +464,7 @@ class Hud:
                 self.ready = True
             except Exception:
                 log(traceback.format_exc())
-            time.sleep(1.0)
+            time.sleep(0.5)   # 对话结束后尽快报出来（再加 hub.SETTLE 和界面 0.5 秒一刷，一共一两秒）
 
     def on_event(self, kind, v, notify):
         """采集线程报上来的事件。finished：记进「已结束」列表，留到用户点掉为止；failed：后台任务没跑起来，也记进去；
@@ -475,7 +477,17 @@ class Hud:
             v = collector.placeholder(v["id"], dict({"ws": "", "prompt": "", "created": now}, **task), self.reg, now)
             v.update(state="error", title="没跑起来：" + v["title"], last_text=reason)
             kind = "finished"
-        if kind == "finished" and time.time() - self.quiet.pop(v["id"], 0) < 30:   # 用户自己说了不用等，这次结束不用再提醒他
+        # 不用提醒的结束：用户刚点了「不用等后台了」，或者结束时用户正看着这个对话（编辑器最前面的标签就是它）。
+        # 记成看过了（不然悬浮窗重启时会把它当成没看过的再列出来），不闪、不推、不进「已结束」
+        if kind == "finished":
+            told = time.time() - self.quiet.pop(v["id"], 0) < 30
+            if told or v["id"] == self.focus_sid:
+                if not told:
+                    log("结束时正看着它，不提醒：%s" % v["title"])
+                self.cfg["seen"] = (self.cfg["seen"] + ["%s@%d" % (v["id"], v["end"])])[-300:]
+                self.save()
+                return
+        if kind == "asking" and v["id"] == self.focus_sid:   # 正看着它在问什么，不用再往手机推
             return
         if kind == "finished":
             key = "%s@%d" % (v["id"], v["end"])
@@ -487,7 +499,7 @@ class Hud:
                 self.save()
             # 悬浮窗开着以后新结束的（notify 为真；启动时就已经结束的不算），做完了或者出错了就闪；用户自己打断的不闪
             if notify and v["state"] in ("done", "error") and self.cfg["flash_on_done"]:
-                self.start_flash()
+                self.start_flash(v["id"])
         # 手机通知（用户在「手机访问…」里配了自己的群机器人才发）
         state = "ask" if kind == "asking" else v.get("state")
         if notify and self.cfg.get("notify_url") and (state in ("done", "error") and self.cfg["notify_done"]
@@ -507,8 +519,10 @@ class Hud:
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- 任务完成时的闪光 ----------
-    def start_flash(self):
-        """开始闪：藏在托盘里就先拿出来。已经在闪就接着闪。"""
+    def start_flash(self, sid=None):
+        """开始闪：藏在托盘里就先拿出来。已经在闪就接着闪。sid：为哪个对话闪的（这些对话都看过了就自己停）。"""
+        if sid:
+            self.flash_for.add(sid)
         if self.hidden:
             self.show()
         if self.flash_since is None:
@@ -527,6 +541,7 @@ class Hud:
 
     def stop_flash(self):
         self.flash_since = None
+        self.flash_for.clear()
         if self.glow:
             self.glow_c.delete("all")
 
@@ -595,9 +610,16 @@ class Hud:
         self.render()
 
     def sync(self):
-        """每次刷新前：收事件；又开工了的对话从「已结束」里拿掉；把「对话 -> 项目名」写给完成通知用。"""
+        """每次刷新前：看用户正看着哪个对话；收事件；正看着的、又开工了的对话从「已结束」里拿掉；
+        把「对话 -> 项目名」写给完成通知用。"""
+        self.focus_sid = self.focused_session()
         while not self.events.empty():
             self.on_event(*self.events.get())
+        if self.focus_sid and any(u["id"] == self.focus_sid for u in self.unread):   # 切到这个对话就算看过了
+            self.mark_read(self.focus_sid)
+        unread_ids = {u["id"] for u in self.unread}
+        if self.flash_for and not self.flash_for & unread_ids:   # 为之闪光的对话都看过了，不用再闪
+            self.stop_flash()
         live = {v["id"] for v in self.views if v["state"] in LIVE}
         if any(u["id"] in live for u in self.unread):
             self.unread[:] = [u for u in self.unread if u["id"] not in live]
@@ -613,6 +635,24 @@ class Hud:
                 pass
 
     # ---------- 对话 / 后台任务 ----------
+    def focused_session(self):
+        """用户此刻正看着的对话：最前面的窗口是编辑器，它当前标签的名字就是这个对话的标题。
+        几个对话同名时，再看窗口开的文件夹是不是对话的启动目录；还分不出来就当看不出来（返回 None）。"""
+        if self.demo or self.shot:
+            return None
+        try:
+            tab = runner.focused_tab()
+        except OSError:
+            return None
+        if not tab:
+            return None
+        name, folder = tab
+        hits = {v["id"]: v for src in (self.views, self.history, self.unread) for v in src if v.get("title") == name}
+        if len(hits) > 1:
+            hits = {k: v for k, v in hits.items()
+                    if os.path.basename((v.get("root") or v.get("ws_path") or "").rstrip("\\/")).lower() == folder.lower()}
+        return next(iter(hits)) if len(hits) == 1 else None
+
     def find(self, sid):
         """一个对话现在的样子：正在跟踪的最新，其次是历史记录，再次是结束那一刻存下来的。"""
         return next((v for src in (self.views, self.history, self.unread) for v in src if v["id"] == sid), None)
