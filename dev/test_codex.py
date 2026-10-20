@@ -12,6 +12,9 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+BOX = tempfile.TemporaryDirectory(prefix="agent-hud-codex-")
+os.environ.update(AGENT_HUD_TEST_ROOT=BOX.name, CLAUDE_CONFIG_DIR=str(Path(BOX.name) / ".claude"),
+                  CODEX_HOME=str(Path(BOX.name) / ".codex"))
 APP = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP))
 import collector
@@ -148,13 +151,9 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(self.session.view(self.now + collector.STALE_TOOL + 1)["state"], "stale")
 
     def test_codex_does_not_open_claude(self):
-        loader = importlib.machinery.SourceFileLoader("hud_test", str(APP / "agent_hud.pyw"))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
+        hud = self.make_hud()
+        module = hud.test_module
         v = self.session.view(self.now)
-        hud = object.__new__(module.Hud)
-        hud.demo = False
         hud.find = lambda sid: v
         hud.mark_read = lambda sid: None
         with patch.object(module.runner, "open_in_editor") as open_claude, patch.object(module, "log"):
@@ -278,36 +277,51 @@ class CodexTests(unittest.TestCase):
         self.assertFalse(reads.is_read(view))
 
     def make_hud(self):
-        import queue
         loader = importlib.machinery.SourceFileLoader("read_hud_test", str(APP / "agent_hud.pyw"))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        hud = object.__new__(module.Hud)
-        hud.unread = []
-        hud.cfg = {"unread": hud.unread, "seen": [], "flash_on_done": True, "notify_url": "", "bg_ignored": []}
-        hud.quiet = {}
-        hud.codex_reads = codex_collector.ReadState()
+        hud = module.Hud(["--demo"])
+        hud.root.withdraw()
+
+        def close():
+            for timer in hud.root.tk.call("after", "info"):
+                hud.root.after_cancel(timer)
+            hud.root.destroy()
+
+        self.addCleanup(close)
         hud.views, hud.history = [], []
-        hud.events = queue.Queue()
-        hud.ws_map = {}
         hud.demo, hud.shot, hud.gone = False, True, False
         hud.render = lambda: None
-        hud.start_flash = lambda: None
+        hud.flash_tick = lambda: None
         hud.save = lambda: (self.base / "hud-config.json").write_text(json.dumps(hud.cfg), encoding="utf-8")
         hud.test_module = module
         return hud
+
+    def test_hud_logs_and_settings_use_test_root(self):
+        hud = self.make_hud()
+        target = Path(BOX.name) / ".claude/agent-hud"
+        self.assertEqual(Path(hud.test_module.LOG), target / "hud.log")
+        self.assertEqual(Path(hud.test_module.CONFIG), target / "config.json")
+        self.assertEqual(Path(collector.PROJECTS), Path(BOX.name) / ".claude/projects")
+        target.mkdir(parents=True, exist_ok=True)
+        hud.test_module.log("isolated Codex test log")
+        self.assertIn("isolated Codex test log", (target / "hud.log").read_text(encoding="utf-8"))
 
     def test_native_read_clears_existing_badge_and_persists(self):
         view = self.native_view()
         self.write_read_state(["same-id"])
         hud = self.make_hud()
         hud.views = [view]
-        hud.on_event("finished", view, False)
+        hud.on_event("finished", view, True)
         self.assertEqual(len(hud.unread), 1)
+        self.assertEqual(hud.flash_for, {view["id"]})
+        self.assertIsNotNone(hud.flash_since)
         self.write_read_state([], modified=self.now + 2)
         hud.sync()
         self.assertEqual(hud.unread, [])
+        self.assertEqual(hud.flash_for, set())
+        self.assertIsNone(hud.flash_since)
         saved = json.loads((self.base / "hud-config.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["unread"], [])
         restarted = self.make_hud()
