@@ -631,14 +631,40 @@ def placeholder(sid, task, reg, now):
     }
 
 
+def session_files(sources):
+    return ([(p, Session) for p in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))]
+            + [item for source in sources for item in source.session_files()])
+
+
+def is_codex(view):
+    return view.get("provider") == "codex" or view.get("id", "").startswith("codex:")
+
+
+def grouped(views, sources, ignored=()):
+    for source in sources:
+        views = source.group_views(views, ignored)
+    return views
+
+
+log = lambda message: print(message, file=sys.stderr)
+
+
+def read_failed(errors, path, error):
+    message = "%s: %s" % (type(error).__name__, error)
+    if errors.get(path) != message:
+        log("读取记录失败，稍后重试：%s：%s" % (path, message))
+    errors[path] = message
+
+
 class History:
     """最近几天的对话（不管现在还跟不跟踪），给按项目的列表看历史用。
     每个文件只读最后一段，按修改时间缓存：文件没动过就不再读。"""
     TAIL = 1 << 20
     EVERY = 15   # 多少秒重新看一遍哪些文件动过
 
-    def __init__(self, reg, days=3):
+    def __init__(self, reg, days=3, sources=()):
         self.reg, self.days = reg, days
+        self.sources, self.errors = sources, {}
         self.cache = {}   # 文件路径 -> (修改时间, 那时候的样子)
         self.next = 0.0
         self.items = []
@@ -650,7 +676,7 @@ class History:
             return self.copies(skip)
         self.next = now + self.EVERY
         items, cache = [], {}
-        for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        for path, session_type in session_files(self.sources):
             try:
                 mtime = os.path.getmtime(path)
             except OSError:
@@ -662,11 +688,13 @@ class History:
                 v = old[1]
             else:
                 try:
-                    s = Session(path, self.reg, tail=self.TAIL)
+                    s = session_type(path, self.reg, tail=self.TAIL)
                     Track.pump(s)
                     v = s.view(now) if s.last_ts else None   # 只有标题之类、没有一句对话的文件不算
-                except (OSError, ValueError):
+                except Exception as error:
+                    read_failed(self.errors, path, error)
                     continue
+                self.errors.pop(path, None)
             cache[path] = (mtime, v)
             if v:
                 items.append(v)
@@ -676,12 +704,15 @@ class History:
     def copies(self, skip):
         """给出去的都是副本：外面会按发起方式、手动指定改项目，不能改到缓存里（不然撤掉手动指定也改不回来）。
         真正在干活的对话都在 skip 里（Collector 跟踪着）；剩下看着还在干活的，是停在半截没收尾的。"""
-        return [dict(v, state="stale") if v["state"] in LIVE else dict(v) for v in self.items if v["id"] not in skip]
+        views = grouped(self.items, self.sources)
+        return [dict(v, state="stale") if v["state"] in LIVE else dict(v)
+                for v in views if v["id"] not in skip and v.get("parent_id") not in skip]
 
 
 class Collector:
-    def __init__(self, reg=None):
+    def __init__(self, reg=None, sources=()):
         self.reg = reg or workspaces.Registry()
+        self.sources, self.errors = sources, {}
         self.owned = {}      # 悬浮窗自己发起的后台任务：会话 id -> 项目路径（发起时就定了，不用猜）
         self.pinned = {}     # 从悬浮窗选了编辑器窗口发起的对话：会话 id -> 发起时选的项目路径
         self.assigned = {}   # 用户在右键菜单里手动指定的：会话 id -> 项目路径（不管碰了什么文件，一律按它算）
@@ -693,28 +724,51 @@ class Collector:
 
     def scan(self, now):
         cutoff = now - TRACK_WINDOW
-        recent = set()
-        for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        recent = {}
+        files = session_files(self.sources)
+        for path, session_type in files:
             try:
-                if os.path.getmtime(path) >= cutoff:
-                    recent.add(path)
-            except OSError:
-                pass
+                if (os.path.getmtime(path) >= cutoff
+                        or session_type is not Session and session_type.recently_active(path, cutoff)):
+                    recent[path] = session_type
+            except Exception as error:
+                read_failed(self.errors, path, error)
         # 主会话在等一个跑很久的子 agent 时，自己的记录不动，靠子 agent 的记录把它找出来
         for sub in glob.glob(os.path.join(PROJECTS, "*", "*", "subagents", "agent-*.jsonl")):
             try:
                 if os.path.getmtime(sub) >= cutoff:
-                    recent.add(os.path.dirname(os.path.dirname(sub)) + ".jsonl")
+                    recent[os.path.dirname(os.path.dirname(sub)) + ".jsonl"] = Session
             except OSError:
                 pass
-        for path in recent:
+        for path, session_type in recent.items():
             if path not in self.sessions and os.path.isfile(path):
                 try:
-                    s = Session(path, self.reg)
+                    s = session_type(path, self.reg)
                     Track.pump(s)
                     self.sessions[path] = s
-                except OSError:
-                    pass
+                    self.errors.pop(path, None)
+                except Exception as error:
+                    read_failed(self.errors, path, error)
+        # A running child can keep a parent alive after its own rollout stops changing.
+        known = {s.sid for s in self.sessions.values()}
+        pending = list(self.sessions.values())
+        while pending:
+            child = pending.pop()
+            parent = getattr(child, "parent_sid", None)
+            if not parent or parent in known:
+                continue
+            match = next(((p, cls) for p, cls in files if p.endswith(child.parent_file_id + ".jsonl")), None)
+            if match:
+                path, session_type = match
+                try:
+                    s = session_type(path, self.reg)
+                    Track.pump(s)
+                    self.sessions[path] = s
+                    known.add(s.sid)
+                    pending.append(s)
+                    self.errors.pop(path, None)
+                except Exception as error:
+                    read_failed(self.errors, path, error)
         for s in self.sessions.values():
             s.scan_subs()
 
@@ -757,12 +811,25 @@ class Collector:
         """返回要显示的会话列表：在干活的在前（按开始时间），刚结束的在后（最近结束的在前）。"""
         now = now or time.time()
         if now >= self.next_scan:
-            self.scan(now)
             self.next_scan = now + RESCAN
+            self.scan(now)
         live, rest = [], []
+        raw_views, paths, expired_children = [], {}, []
         for path, s in list(self.sessions.items()):
-            s.pump()
-            v = s.view(now, self.ignored)
+            try:
+                s.pump()
+                v = s.view(now, self.ignored)
+                self.errors.pop(path, None)
+            except Exception as error:
+                read_failed(self.errors, path, error)
+                del self.sessions[path]
+                continue
+            raw_views.append(v)
+            paths[v["id"]] = path
+            if getattr(s, "parent_sid", None) and v["state"] not in LIVE and now - v["last"] > TRACK_WINDOW:
+                expired_children.append(path)
+        for v in grouped(raw_views, self.sources, self.ignored):
+            path = paths[v["id"]]
             self.place(v)
             if v["state"] in LIVE:
                 live.append(v)
@@ -777,6 +844,8 @@ class Collector:
                 del self.sessions[path]
         live.sort(key=lambda v: v["start"])
         rest.sort(key=lambda v: -v["end"])
+        for path in expired_children:
+            self.sessions.pop(path, None)
         return live + rest
 
 

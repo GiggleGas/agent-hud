@@ -31,6 +31,7 @@ from tkinter import filedialog, messagebox
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import collector  # noqa: E402
+import codex_collector  # noqa: E402
 import dialogs  # noqa: E402
 import feedback  # noqa: E402
 import hub  # noqa: E402
@@ -229,6 +230,7 @@ class Hud:
         self.args = args
         self.gone = False   # 卸载之后不再往磁盘上写东西
         self.cfg = {"x": None, "y": None, "collapsed": False, "live_only": False, "alpha": 100, "unread": [], "seen": [],
+                    "codex_on": True,
                     "permission_mode": "auto", "last_ws": "",
                     "history_days": 3,   # 「按项目」里看几天内的记录
                     "tab": "recent",     # 当前分栏：recent（最近 24 小时）/ projects（按项目）
@@ -263,6 +265,7 @@ class Hud:
         self.recent_all = False         # 「最近 24 小时」里是不是全部显示（否则只显示前 RECENT_ROWS 条）
         self.events = queue.Queue()     # 采集线程发现的事件，界面线程来取
         self.unread = self.cfg["unread"]   # 已结束、还没点掉的会话（存的是结束那一刻的样子），新的在前
+        self.codex_reads = codex_collector.ReadState()
         self.ws_map = None              # 上次写进 SESSIONS 的内容
         self.reg = None if self.demo else workspaces.Registry()
         self.runner = None if self.demo else runner.Runner(
@@ -310,6 +313,8 @@ class Hud:
         self.v_rule, self.v_auto = tk.BooleanVar(), tk.BooleanVar()
         self.menu = menu = tk.Menu(root, tearoff=0, postcommand=self.sync_menu)
         menu.add_checkbutton(label="只看在干活的", variable=self.v_live, command=self.on_option)
+        self.v_codex = tk.BooleanVar(value=self.cfg["codex_on"])
+        menu.add_checkbutton(label="显示 Codex 任务", variable=self.v_codex, command=self.on_option)
         self.v_flash = tk.BooleanVar(value=self.cfg["flash_on_done"])
         menu.add_checkbutton(label="任务完成时闪光提醒", variable=self.v_flash, command=self.on_option)
         alpha = tk.Menu(menu, tearoff=0)
@@ -445,6 +450,11 @@ class Hud:
         events = hub.Hub()
         while True:
             try:
+                sources = (codex_collector,) if self.cfg.get("codex_on", True) else ()
+                changed_sources = col.sources != sources
+                if changed_sources:
+                    col = collector.Collector(self.reg, sources=sources)
+                    history = collector.History(self.reg, self.cfg["history_days"], sources=sources)
                 self.runner.tick()
                 col.owned, col.running, col.exited = self.runner.owned(), self.runner.active(), dict(self.runner.exited)
                 col.pinned, col.assigned = dict(self.cfg["pinned"]), dict(self.cfg["assigned"])
@@ -455,9 +465,15 @@ class Hud:
                     col.next_scan = 0
                     live = sum(1 for v in views if v["state"] in LIVE)
                     views[live:live] = [collector.placeholder(sid, t, self.reg, time.time()) for sid, t in starting]
+                if changed_sources and not events.first:
+                    for v in views:
+                        if collector.is_codex(v):
+                            events.state[v["id"]] = v["state"]
+                            if v["state"] in hub.ENDED:
+                                self.events.put(("finished", v, False))
                 for event in events.update(views):
                     self.events.put(event)
-                past = history.recent({s.sid for s in col.sessions.values()} | {v["id"] for v in views})
+                past = history.recent({v["id"] for v in views})
                 for v in past:
                     col.place(v)
                 self.views, self.history = views, past
@@ -469,6 +485,8 @@ class Hud:
     def on_event(self, kind, v, notify):
         """采集线程报上来的事件。finished：记进「已结束」列表，留到用户点掉为止；failed：后台任务没跑起来，也记进去；
         read：在手机上看过了（网页服务的线程报上来，界面上的东西只能在这个线程里动）。"""
+        if not self.enabled(v):
+            return
         if kind == "read":
             self.mark_read(v["id"])
             return
@@ -491,15 +509,24 @@ class Hud:
             return
         if kind == "finished":
             key = "%s@%d" % (v["id"], v["end"])
+            if collector.is_codex(v) and self.codex_reads.is_read(v):
+                self.cfg["seen"] = (self.cfg["seen"] + [key])[-300:]
+                self.unread[:] = [u for u in self.unread if u["id"] != v["id"]]
+                self.save()
+                return
             if key not in self.cfg["seen"]:
                 snap = {k: v[k] for k in ("id", "title", "ws", "ws_color", "ws_path", "owned", "state", "start", "end", "prompt")}
                 snap.update(key=key, last_text=v["last_text"][:2000], root=v.get("root", ""), timed=v.get("timed", True))
+                if collector.is_codex(v):
+                    snap.update(provider="codex", codex_desktop=v.get("codex_desktop", False), read_identity=v.get("read_identity"))
                 rest = [u for u in self.unread if u["id"] != v["id"]]
                 self.unread[:] = sorted([snap] + rest, key=lambda u: -u["end"])[:20]
                 self.save()
             # 悬浮窗开着以后新结束的（notify 为真；启动时就已经结束的不算），做完了或者出错了就闪；用户自己打断的不闪
             if notify and v["state"] in ("done", "error") and self.cfg["flash_on_done"]:
                 self.start_flash(v["id"])
+        if collector.is_codex(v):
+            return
         # 手机通知（用户在「手机访问…」里配了自己的群机器人才发）
         state = "ask" if kind == "asking" else v.get("state")
         if notify and self.cfg.get("notify_url") and (state in ("done", "error") and self.cfg["notify_done"]
@@ -615,6 +642,12 @@ class Hud:
         self.focus_sid = self.focused_session()
         while not self.events.empty():
             self.on_event(*self.events.get())
+        read_ids = {u["id"] for u in self.unread if self.enabled(u) and collector.is_codex(u)
+                    and self.codex_reads.is_read(self.find(u["id"]))}
+        if read_ids:
+            self.cfg["seen"] = (self.cfg["seen"] + [u["key"] for u in self.unread if u["id"] in read_ids])[-300:]
+            self.unread[:] = [u for u in self.unread if u["id"] not in read_ids]
+            self.save()
         if self.focus_sid and any(u["id"] == self.focus_sid for u in self.unread):   # 切到这个对话就算看过了
             self.mark_read(self.focus_sid)
         unread_ids = {u["id"] for u in self.unread}
@@ -624,8 +657,8 @@ class Hud:
         if any(u["id"] in live for u in self.unread):
             self.unread[:] = [u for u in self.unread if u["id"] not in live]
             self.save()
-        ws_map = {u["id"]: u["ws"] for u in self.unread}
-        ws_map.update((v["id"], v["ws"]) for v in self.views)
+        ws_map = {u["id"]: u["ws"] for u in self.unread if self.enabled(u)}
+        ws_map.update((v["id"], v["ws"]) for v in self.views if self.enabled(v))
         if ws_map != self.ws_map and not (self.demo or self.shot or self.gone):
             self.ws_map = ws_map
             try:
@@ -653,6 +686,9 @@ class Hud:
                     if os.path.basename((v.get("root") or v.get("ws_path") or "").rstrip("\\/")).lower() == folder.lower()}
         return next(iter(hits)) if len(hits) == 1 else None
 
+    def enabled(self, v):
+        return self.cfg.get("codex_on", True) or not collector.is_codex(v)
+
     def find(self, sid):
         """一个对话现在的样子：正在跟踪的最新，其次是历史记录，再次是结束那一刻存下来的。"""
         return next((v for src in (self.views, self.history, self.unread) for v in src if v["id"] == sid), None)
@@ -664,6 +700,8 @@ class Hud:
         if self.demo or not v:
             return
         self.mark_read(sid)
+        if collector.is_codex(v):
+            return
         runner.open_in_editor(sid, v.get("root") or v.get("ws_path") or "")
 
     def stop_task(self, sid):
@@ -680,7 +718,8 @@ class Hud:
             self.menu.tk_popup(e.x_root, e.y_root)
             return
         m = tk.Menu(self.root, tearoff=0)
-        m.add_command(label="在编辑器里打开", command=lambda: self.open_session(sid))
+        if not collector.is_codex(v):
+            m.add_command(label="在编辑器里打开", command=lambda: self.open_session(sid))
         if v.get("owned") and v["state"] in LIVE:
             m.add_command(label="停止这个后台任务…", command=lambda: self.stop_task(sid))
         if v["state"] == "bg":
@@ -872,6 +911,7 @@ class Hud:
 
     def on_option(self):
         self.cfg["live_only"], self.cfg["alpha"] = self.v_live.get(), self.v_alpha.get()
+        self.cfg["codex_on"] = self.v_codex.get()
         self.cfg["close_action"] = self.v_close.get()
         self.cfg["flash_on_done"] = self.v_flash.get()
         if not self.cfg["flash_on_done"]:
@@ -996,8 +1036,8 @@ class Hud:
         now = time.time()
         folded = self.cfg["collapsed"]
         w = W_FOLDED if folded else W
-        live = [v for v in self.views if v["state"] in LIVE]
-        unread = {u["id"] for u in self.unread}
+        live = [v for v in self.views if v["state"] in LIVE and self.enabled(v)]
+        unread = {u["id"] for u in self.unread if self.enabled(u)}
         quota = 0 if folded or not self.usage else USAGE_H   # Claude 用量那一行（查不到用量就没有）
         fresh = 0 if folded or not self.update_info else UPDATE_H   # 「有新版本」那一行
         top = 34 if folded else 62 + fresh + quota   # 标题栏、新版本、用量、分栏按钮；这一块不跟着滚
@@ -1027,7 +1067,7 @@ class Hud:
             self.anim = [(k, i, [b[0], b[1] - self.scroll, b[2], b[3] - self.scroll] if b else b, x) for k, i, b, x in self.anim]
         self.rr(1, 1, w - 1, 30, 11, fill=C["panel"], outline="")
         c.create_rectangle(1, 14, w - 1, top, fill=C["panel"], outline="")
-        done = [u for u in self.unread if not self.cfg["live_only"]]
+        done = [u for u in self.unread if not self.cfg["live_only"] and self.enabled(u)]
         self.header(w, live, done)
         if self.tray:
             parts, state = self.summary(live, done)
@@ -1067,7 +1107,7 @@ class Hud:
         ended = {}
         for v in list(self.unread) + list(self.history) + [v for v in self.views if v["state"] not in LIVE]:
             ended[v["id"]] = v
-        return [v for v in ended.values() if v["id"] not in live]
+        return [v for v in ended.values() if v["id"] not in live and self.enabled(v)]
 
     @staticmethod
     def when(v):
@@ -1077,7 +1117,7 @@ class Hud:
     def groups(self):
         """按项目分组：[{name, color, live: [在干活的], done: [结束了的], items: [全部，最近有动静的在前]}]。
         有在干活的项目排在前面（按它最早那个任务开始的时间，位置稳定），其余按最近一次有动静的时间。"""
-        live = [v for v in self.views if v["state"] in LIVE]
+        live = [v for v in self.views if v["state"] in LIVE and self.enabled(v)]
         out = {}
         for v in live + self.ended_items():
             g = out.setdefault(v["ws"], {"name": v["ws"], "color": v["ws_color"], "live": [], "done": []})
@@ -1525,6 +1565,7 @@ def main():
     args = sys.argv[1:]
     install.clean_env()
     runner.log = log
+    collector.log = log
     if not ("--demo" in args or "--shot" in args):
         mutex = acquire()  # noqa: F841  进程活着就得一直攥着它
         if mutex is None:

@@ -21,7 +21,7 @@ except ImportError:   # 不是 Windows；下面 __main__ 里会给出提示
     winreg = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ("agent_hud.pyw", "collector.py", "hub.py", "workspaces.py", "runner.py", "dialogs.py", "feedback.py", "feedback_to.py",
+FILES = ("agent_hud.pyw", "collector.py", "codex_collector.py", "hub.py", "workspaces.py", "runner.py", "dialogs.py", "feedback.py", "feedback_to.py",
          "tray.py", "usage.py", "notify.py", "updates.py", "web.py", "install.py")
 OLD_FILES = ("feishu.py", "feishu.json")   # 以前的版本装过、现在不用了的，升级时删掉
 DIRS = ("segno",)   # 整个目录一起复制的：二维码库（纯 Python，原样放进来的，许可证在它的 LICENSE 里）

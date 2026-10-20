@@ -22,6 +22,7 @@ def check(name, got, want):
 # 仿造一个会话，把各种状态走一遍：进度标记、子 agent 交回 / 失败、提问、等确认、打断
 # 记录格式照 Claude Code 2.1.296 写的；升级后悬浮窗认错状态，先对照真实记录改这里的仿造数据
 root = tempfile.mkdtemp(prefix="agent-hud-test-")
+os.environ["CODEX_HOME"] = os.path.join(root, ".codex")
 proj = os.path.join(root, "f--Work-Game")
 os.makedirs(os.path.join(proj, "sess1", "subagents"))
 collector.PROJECTS = root

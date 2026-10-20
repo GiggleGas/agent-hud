@@ -146,6 +146,20 @@ check("等后台的带着后台命令：说明、输出的最后一行、是不�
 check("24 小时内结束的不含一天以前的", all(state["now"] - v["when"] <= 86400 for v in state["recent"]) and "清理过期的发布分支" in {v["title"] for v in state["recent"]})
 check("每条带项目、颜色、标题，不带摘要", all({"ws", "color", "title", "state"} <= set(v) and "summary" not in v for v in state["recent"]))
 
+codex_live = dict(h.views[0], id="codex:live", provider="codex", ws="Codex only")
+codex_done = dict(h.history[-1], id="codex:done", provider="codex", ws="Codex only", key="codex:done@1")
+h.views.append(codex_live)
+h.history.append(codex_done)
+h.unread.append(codex_done)
+mixed = json.loads(get("/api/state", phone)[1])
+check("手机列表只显示可打开的 Claude 对话，Codex 不占项目计数",
+      mixed["live"] == state["live"] and mixed["recent"] == state["recent"] and mixed["projects"] == state["projects"])
+check("手机仍不能打开或回复 Codex", get("/api/conv?id=codex:live", phone)[0] == 404
+      and get("/api/reply", phone, {"id": "codex:live", "text": "test"})[0] == 400)
+h.views.remove(codex_live)
+h.history.remove(codex_done)
+h.unread.remove(codex_done)
+
 print("== 对话页")
 conv = json.loads(get("/api/conv?id=" + sid, phone)[1])
 check("对话页有消息和最后的回复", conv["messages"][-1]["text"].startswith("**改好了**"), conv)
