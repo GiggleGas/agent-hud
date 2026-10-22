@@ -292,6 +292,17 @@ runner.focused_tab = lambda: ("调第 7 关数值", "agent-hud")
 h.sync()
 check("切到这个对话：算看过了，为它闪的光也停了",
       (any(u["id"] == "f-1" for u in h.unread), h.flash_since) == (False, None), h.flash_since)
+old = dict(other, id="f-4", title="早就做完的", end=other["end"] - 3600)
+h.history = h.history + [old]
+runner.focused_tab = lambda: ("早就做完的", "shop")
+h.sync()
+logged, real_log = [], mod.log
+mod.log = logged.append   # 测试目录里还没有日志文件夹，真的 log() 会悄悄写不进去，这里直接截住
+h.on_event("finished", old, False)   # 悬浮窗刚启动时把早就结束的都报一遍（不对外提醒）
+h.sync()
+mod.log = real_log
+check("启动时报上来的旧对话正好在看：不当成「刚结束」、不写日志，下一刻按「切过去算看过」标成已读",
+      not logged and not any(u["id"] == "f-4" for u in h.unread), logged)
 runner.focused_tab = real_tab
 h.demo = True
 h.root.destroy()

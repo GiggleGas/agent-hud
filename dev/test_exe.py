@@ -76,7 +76,9 @@ try:
     cfg = os.path.join(BOX, "yes", ".claude", "agent-hud", "config.json")
     check("选「是」：规则写进了 CLAUDE.md", os.path.exists(rule) and b"agent-hud:begin" in open(rule, "rb").read())
     check("记下问过了", os.path.exists(cfg) and json.load(open(cfg)).get("rule_asked") is True)
-    check("读真实会话记录时没有报错", code == 0 and not os.path.exists(os.path.join(os.path.dirname(cfg), "hud.log")))
+    hud_log = os.path.join(os.path.dirname(cfg), "hud.log")
+    check("读真实会话记录时没有报错", code == 0 and not os.path.exists(hud_log),
+          (code, open(hud_log, encoding="utf-8", errors="replace").read()[-1500:] if os.path.exists(hud_log) else ""))
     os.remove(rule)
     run(exe, "yes", "--yes")
     check("第二次运行不再问、不再加", not os.path.exists(rule))

@@ -45,7 +45,7 @@ import web  # noqa: E402
 import workspaces  # noqa: E402
 from collector import LIVE  # noqa: E402
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 NAME = "Agent 悬浮窗"
 CONFIG = os.path.join(install.TARGET, "config.json")   # 脚本版和 exe 版共用同一份设置
 LOG = os.path.join(install.TARGET, "hud.log")
@@ -499,7 +499,9 @@ class Hud:
         # 记成看过了（不然悬浮窗重启时会把它当成没看过的再列出来），不闪、不推、不进「已结束」
         if kind == "finished":
             told = time.time() - self.quiet.pop(v["id"], 0) < 30
-            if told or v["id"] == self.focus_sid:
+            # 「正看着它」只管真的刚结束的（notify 为真）；悬浮窗启动时把早就结束的都报一遍，那些照常处理，
+            # 正看着的那个下一刻会因为「切过去算看过」被标成已读
+            if told or (notify and v["id"] == self.focus_sid):
                 if not told:
                     log("结束时正看着它，不提醒：%s" % v["title"])
                 self.cfg["seen"] = (self.cfg["seen"] + ["%s@%d" % (v["id"], v["end"])])[-300:]
